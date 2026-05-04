@@ -12,6 +12,14 @@ def get_attention_backend(backend_name: str) -> Type[AttentionBackend]:
         return VanillaAttention
     elif backend_name == "TRTLLM":
         return TrtllmAttention
+    elif backend_name == "TURBOQUANT":
+        # turboquant-rs KV-cache compression backend. v1 round-trips
+        # K/V through the Hadamard + Lloyd-Max + inverse pipeline on
+        # every cache write; storage stays fp16 in this version. v2
+        # adds compressed-paged storage for real memory savings.
+        from .turboquant import TurboquantAttention
+
+        return TurboquantAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
 
