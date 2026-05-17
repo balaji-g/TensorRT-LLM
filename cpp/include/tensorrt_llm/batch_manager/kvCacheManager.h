@@ -645,6 +645,27 @@ public:
         return mPools.at(poolIdx);
     }
 
+    // Mutable accessor for KVCacheManager subclasses that need to resize
+    // the per-block pool layout (e.g. TurboquantKVCacheManager packs
+    // each (token, head) slot into bits/8 bytes + an inline fp32 norm
+    // instead of the fp16/bf16 default). External callers must NOT use
+    // this — it bypasses the const invariants the rest of the runtime
+    // relies on.
+    [[nodiscard]] KVCacheBlockPool& getMutablePool(SizeType32 poolIdx)
+    {
+        return mPools.at(poolIdx);
+    }
+
+    [[nodiscard]] SizeType32 getMutablePoolCount() const noexcept
+    {
+        return static_cast<SizeType32>(mPools.size());
+    }
+
+    [[nodiscard]] nvinfer1::DataType getDataType() const noexcept
+    {
+        return mDataType;
+    }
+
     [[nodiscard]] bool containsBlockScales(SizeType32 poolIdx) const
     {
         return mPools.at(poolIdx).containsBlockScales;
@@ -1098,11 +1119,35 @@ public:
         return mWindowBlockManagers.at(windowSize).getBufferManager();
     }
 
+    // Pool dtype is uniform across windows in current TRT-LLM (one
+    // KVCacheManager per attention window family but the dtype is
+    // engine-wide). Subclasses use this to convert their per-block
+    // byte budget into the blockSize field's element-count units.
+    [[nodiscard]] nvinfer1::DataType getDataType() const
+    {
+        TLLM_CHECK_WITH_INFO(!mWindowBlockManagers.empty(),
+            "BlockManager::getDataType called before any WindowBlockManager was constructed");
+        return mWindowBlockManagers.begin()->second.getDataType();
+    }
+
     [[nodiscard]] KVCacheBlockPool const& getPool(SizeType32 poolIdx) const
     {
         auto const windowSize = getPoolWindowSize(poolIdx);
         auto const relativePoolIndex = mAbsolutePoolToRelativePoolIndex.at(poolIdx);
         return mWindowBlockManagers.at(windowSize).getPool(relativePoolIndex);
+    }
+
+    // Mutable pool accessor — KVCacheManager subclasses use this to
+    // rewrite per-(token, head) slot byte budget BEFORE allocatePools
+    // walks the pool list (e.g. TurboquantKVCacheManager packs slots
+    // into bits/8 bytes + an inline fp32 norm). External callers must
+    // not use this; it bypasses const invariants the rest of the
+    // runtime relies on.
+    [[nodiscard]] KVCacheBlockPool& getMutablePool(SizeType32 poolIdx)
+    {
+        auto const windowSize = getPoolWindowSize(poolIdx);
+        auto const relativePoolIndex = mAbsolutePoolToRelativePoolIndex.at(poolIdx);
+        return mWindowBlockManagers.at(windowSize).getMutablePool(relativePoolIndex);
     }
 
 private:
@@ -1440,6 +1485,19 @@ public:
     {
         return mBlockManager;
     }
+
+    // Mutable block manager accessor for subclasses that need to
+    // restructure the per-block pool layout (e.g.
+    // TurboquantKVCacheManager packs slots into bits/8 bytes + an
+    // inline fp32 norm in its allocatePools override). Protected so
+    // external callers cannot bypass const-correctness.
+protected:
+    [[nodiscard]] BlockManager& getMutableBlockManager()
+    {
+        return mBlockManager;
+    }
+
+public:
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request by one or two
     /// iterations
