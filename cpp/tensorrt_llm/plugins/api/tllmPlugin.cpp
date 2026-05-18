@@ -26,6 +26,7 @@
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
+#include "tensorrt_llm/plugins/turboquantAttentionPlugin/turboquantAttentionPlugin.h"
 #include "tensorrt_llm/plugins/identityPlugin/identityPlugin.h"
 #include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/lookupPlugin/lookupPlugin.h"
@@ -210,6 +211,7 @@ extern "C"
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
         static tensorrt_llm::plugins::FusedLayernormPluginCreator fusedLayernormPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
+        static tensorrt_llm::plugins::TurboquantAttentionPluginCreator turboquantAttentionPluginCreator;
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
         static tensorrt_llm::plugins::GemmSwigluPluginCreator gemmSwigluPluginCreator;
         static tensorrt_llm::plugins::Fp8RowwiseGemmPluginCreator fp8RowwiseGemmPluginCreator;
@@ -251,6 +253,7 @@ extern "C"
             = { creatorPtr(identityPluginCreator),
                   creatorPtr(bertAttentionPluginCreator),
                   creatorPtr(gptAttentionPluginCreator),
+                  creatorPtr(turboquantAttentionPluginCreator),
                   creatorPtr(gemmPluginCreator),
                   creatorPtr(gemmSwigluPluginCreator),
                   creatorPtr(fp8RowwiseGemmPluginCreator),

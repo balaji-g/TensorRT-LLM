@@ -53,6 +53,7 @@ set(PLUGIN_LISTS
     fusedLayernormPlugin
     gptAttentionCommon
     gptAttentionPlugin
+    turboquantAttentionPlugin
     identityPlugin
     gemmPlugin
     gemmSwigluPlugin
