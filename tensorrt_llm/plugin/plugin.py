@@ -170,6 +170,26 @@ class PluginConfig(metaclass=PluginConfigMeta):
             "help":
             "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models."
         })
+    _turboquant_attention_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "When set (\"float16\" / \"bfloat16\"), the engine builder selects "
+            "TurboquantAttention (paired with TurboquantKVCacheManager at runtime) "
+            "instead of the stock GPTAttention plugin. The persistent KV cache is "
+            "allocated as packed bits + inline fp32 norms per (token, head) slot, "
+            "shrinking the pool by ~1.94x (bits=8) or ~3.76x (bits=4) on Llama-3 "
+            "reference shape. Must be paired with turboquant_bits ∈ {4, 8}."
+        })
+    _turboquant_bits: Optional[int] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "Bit-depth for TurboQuant compressed KV cache. Must be 4 or 8 when "
+            "turboquant_attention_plugin is enabled; ignored otherwise."
+        })
     _gemm_plugin: Optional[str] = field(
         default=None,
         init=False,
@@ -589,6 +609,8 @@ cli_plugin_args = [
     # Plugins
     "bert_attention_plugin",
     "gpt_attention_plugin",
+    "turboquant_attention_plugin",
+    "turboquant_bits",
     "gemm_plugin",
     "gemm_swiglu_plugin",
     "fp8_rowwise_gemm_plugin",

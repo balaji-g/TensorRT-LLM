@@ -5504,9 +5504,27 @@ def gpt_attention(
     assert (alibi_slopes is not None) == (position_embedding_type.is_alibi())
     assert (mrope_rotary_cos_sin
             is not None) == (position_embedding_type.is_mrope())
-    attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
-        'GPTAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
-    assert attn_plg_creator is not None
+    # When PluginConfig.turboquant_attention_plugin is set (with bits ∈ {4,8}),
+    # route through our in-tree TurboquantAttention plugin instead of the stock
+    # GPTAttention. The serialized engine then records "TurboquantAttention"
+    # which is what TurboquantKVCacheManager's runtime selection keys on.
+    _turboquant_attn_plugin = default_net(
+    ).plugin_config.turboquant_attention_plugin
+    _turboquant_bits = default_net().plugin_config.turboquant_bits
+    if _turboquant_attn_plugin:
+        assert _turboquant_bits in (4, 8), (
+            f"turboquant_attention_plugin requires turboquant_bits ∈ {{4, 8}}, "
+            f"got {_turboquant_bits!r}")
+        attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            'TurboquantAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        assert attn_plg_creator is not None, (
+            "TurboquantAttention plugin not registered. "
+            "Build the fork from balaji-g/TensorRT-LLM:turboquant-integration "
+            "and ensure libnvinfer_plugin_tensorrt_llm.so contains the new plugin.")
+    else:
+        attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            'GPTAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        assert attn_plg_creator is not None
     assert host_context_lengths is not None or not default_net(
     ).plugin_config.remove_input_padding
     assert isinstance(max_context_length, int)
@@ -5741,7 +5759,7 @@ def gpt_attention(
         "use_logn_scaling", np.array(np.int8(use_logn_scaling), dtype=np.int8),
         trt.PluginFieldType.INT8)
 
-    pfc = trt.PluginFieldCollection([
+    pfc_fields = [
         layer_idx, nheads, vision_start, vision_length, num_kv_heads,
         num_kv_heads_origin, head_size, unidirectional, q_scaling,
         attn_logit_softcapping_scale, position_embedding_type,
@@ -5762,7 +5780,13 @@ def gpt_attention(
         kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
         fuse_fp4_quant_pf, skip_attn_pf, cp_size, cp_rank, cp_group,
         use_logn_scaling
-    ])
+    ]
+    if _turboquant_attn_plugin:
+        pfc_fields.append(
+            trt.PluginField("turboquant_bits",
+                            np.array([int(_turboquant_bits)], np.int32),
+                            trt.PluginFieldType.INT32))
+    pfc = trt.PluginFieldCollection(pfc_fields)
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
     assert attn_plug
