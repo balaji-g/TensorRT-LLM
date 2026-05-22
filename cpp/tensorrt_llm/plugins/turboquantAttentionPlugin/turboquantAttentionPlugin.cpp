@@ -21,6 +21,7 @@
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 
+#include <atomic>
 #include <cstring>
 
 namespace tensorrt_llm::plugins
@@ -82,6 +83,33 @@ TurboquantAttentionPlugin::TurboquantAttentionPlugin(void const* data, size_t le
     auto const* tail = static_cast<char const*>(data) + length - sizeof(int);
     std::memcpy(&mTurboquantBits, tail, sizeof(int));
     validateBits(mTurboquantBits);
+}
+
+int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
+    cudaStream_t stream) noexcept
+{
+    // v1: telemetry only — log the first invocation and forward to parent.
+    // This proves PluginConfig.turboquant_attention_plugin actually routes
+    // through our class at inference time. The K1/K2 round-trip math hook
+    // lands in B.2.1b after the kernel sources are vendored.
+    static std::atomic<bool> sLogged{false};
+    bool expected = false;
+    if (sLogged.compare_exchange_strong(expected, true))
+    {
+        int nbDims = inputDesc[0].dims.nbDims;
+        int qkvDim = nbDims > 0 ? inputDesc[0].dims.d[nbDims - 1] : 0;
+        int nTokens = 1;
+        for (int i = 0; i < nbDims - 1; ++i)
+        {
+            nTokens *= inputDesc[0].dims.d[i];
+        }
+        TLLM_LOG_INFO(
+            "TurboquantAttentionPlugin::enqueue#1 — bits=%d nTokens=%d qkvDim=%d dtype=%d. "
+            "Math hook is OFF in this build (B.2.1b will add K1/K2 round-trip).",
+            mTurboquantBits, nTokens, qkvDim, static_cast<int>(inputDesc[0].type));
+    }
+    return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, inputs, outputs, workspace, stream);
 }
 
 char const* TurboquantAttentionPlugin::getPluginType() const noexcept

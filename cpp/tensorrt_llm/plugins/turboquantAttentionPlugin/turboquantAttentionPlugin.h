@@ -68,6 +68,14 @@ public:
     char const* getPluginVersion() const noexcept override;
     TurboquantAttentionPlugin* clone() const noexcept override;
 
+    // IPluginV2DynamicExt — telemetry-wrapped forward. v1 logs the
+    // first invocation (shape + bits) and forwards to GPTAttentionPlugin
+    // unchanged. The K1/K2 streaming round-trip math hook lands in
+    // B.2.1b once the kernel sources are vendored under
+    // cpp/tensorrt_llm/kernels/turboquant/.
+    int enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
+
     // Serialization: append turboquantBits after parent's common payload.
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
