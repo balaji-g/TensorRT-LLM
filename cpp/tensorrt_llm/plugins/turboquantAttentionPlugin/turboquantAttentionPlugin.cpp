@@ -18,11 +18,14 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/turboquant/turboquantConstants.h"
+#include "tensorrt_llm/kernels/turboquant/turboquantStreaming.h"
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 
 #include <atomic>
 #include <cstring>
+#include <cuda_runtime.h>
 
 namespace tensorrt_llm::plugins
 {
@@ -32,10 +35,150 @@ namespace
 constexpr char const* TURBOQUANT_ATTENTION_PLUGIN_NAME = "TurboquantAttention";
 constexpr char const* TURBOQUANT_ATTENTION_PLUGIN_VERSION = "1";
 
+// d_head is locked to 128 for the v1 demo (Llama-3 / DeepSeek-7B /
+// Mistral all use 128). Other head sizes require a different
+// Hadamard butterfly and different codebook constants — out of
+// scope for B.2.1b.
+constexpr int kDHead = 128;
+constexpr int kDtypeFP16 = 0; // matches tq_dtype::TQ_DTYPE_FP16
+
 void validateBits(int bits)
 {
     TLLM_CHECK_WITH_INFO(bits == 4 || bits == 8,
         "TurboquantAttentionPlugin: turboquantBits must be 4 or 8, got %d", bits);
+}
+
+// Device-resident quantizer state. Lazy initialized on first enqueue.
+// Shared across all plugin instances since the math is deterministic
+// for (d_head=128, bits, seed=0). Process-wide singleton; freed at
+// atexit / process teardown.
+struct DeviceQuantState
+{
+    int8_t* signs{nullptr};
+    float* centroids{nullptr};
+    float* thresholds{nullptr};
+    int bits{0};
+
+    bool initOnce(int b)
+    {
+        if (signs != nullptr && bits == b)
+        {
+            return true;
+        }
+        if (signs != nullptr && bits != b)
+        {
+            // Re-init for a different bit-depth. Free old.
+            if (signs)
+            {
+                cudaFree(signs);
+                signs = nullptr;
+            }
+            if (centroids)
+            {
+                cudaFree(centroids);
+                centroids = nullptr;
+            }
+            if (thresholds)
+            {
+                cudaFree(thresholds);
+                thresholds = nullptr;
+            }
+        }
+        int8_t const* hostSigns = nullptr;
+        float const* hostCentroids = nullptr;
+        float const* hostThresholds = nullptr;
+        int nCentroids = 0;
+        int nThresholds = 0;
+        if (b == 8)
+        {
+            hostSigns = turboquant::constants::b8_d128::kSigns;
+            hostCentroids = turboquant::constants::b8_d128::kCentroids;
+            hostThresholds = turboquant::constants::b8_d128::kThresholds;
+            nCentroids = 256;
+            nThresholds = 255;
+        }
+        else
+        {
+            hostSigns = turboquant::constants::b4_d128::kSigns;
+            hostCentroids = turboquant::constants::b4_d128::kCentroids;
+            hostThresholds = turboquant::constants::b4_d128::kThresholds;
+            nCentroids = 16;
+            nThresholds = 15;
+        }
+        if (cudaMalloc(&signs, kDHead) != cudaSuccess)
+            return false;
+        if (cudaMalloc(&centroids, nCentroids * sizeof(float)) != cudaSuccess)
+            return false;
+        if (cudaMalloc(&thresholds, nThresholds * sizeof(float)) != cudaSuccess)
+            return false;
+        cudaMemcpy(signs, hostSigns, kDHead, cudaMemcpyHostToDevice);
+        cudaMemcpy(centroids, hostCentroids, nCentroids * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(thresholds, hostThresholds, nThresholds * sizeof(float), cudaMemcpyHostToDevice);
+        bits = b;
+        TLLM_LOG_INFO("TurboquantAttentionPlugin: DeviceQuantState initialised (d_head=%d, bits=%d)", kDHead, bits);
+        return true;
+    }
+};
+
+DeviceQuantState gQuantState;
+
+} // namespace
+
+void TurboquantEnqueueWorkspace::free()
+{
+    if (packed)
+    {
+        cudaFree(packed);
+        packed = nullptr;
+    }
+    if (norms)
+    {
+        cudaFree(norms);
+        norms = nullptr;
+    }
+    if (kv_out)
+    {
+        cudaFree(kv_out);
+        kv_out = nullptr;
+    }
+    packed_capacity = 0;
+    norms_capacity = 0;
+    kv_out_capacity = 0;
+}
+
+namespace
+{
+bool ensureWorkspace(TurboquantEnqueueWorkspace& ws, int nTokens, int nHeads, int dHead, int bits)
+{
+    std::size_t packedBytes = static_cast<std::size_t>(nTokens) * nHeads * dHead * bits / 8;
+    std::size_t normsBytes = static_cast<std::size_t>(nTokens) * nHeads * sizeof(float);
+    std::size_t kvBytes = static_cast<std::size_t>(nTokens) * nHeads * dHead * sizeof(std::uint16_t); // fp16
+
+    if (packedBytes > ws.packed_capacity)
+    {
+        if (ws.packed)
+            cudaFree(ws.packed);
+        if (cudaMalloc(&ws.packed, packedBytes) != cudaSuccess)
+            return false;
+        ws.packed_capacity = packedBytes;
+    }
+    if (normsBytes > ws.norms_capacity)
+    {
+        if (ws.norms)
+            cudaFree(ws.norms);
+        if (cudaMalloc(reinterpret_cast<void**>(&ws.norms), normsBytes) != cudaSuccess)
+            return false;
+        ws.norms_capacity = normsBytes;
+    }
+    if (kvBytes > ws.kv_out_capacity)
+    {
+        if (ws.kv_out)
+            cudaFree(ws.kv_out);
+        if (cudaMalloc(&ws.kv_out, kvBytes) != cudaSuccess)
+            return false;
+        ws.kv_out_capacity = kvBytes;
+    }
+    return true;
 }
 } // namespace
 
@@ -70,8 +213,8 @@ TurboquantAttentionPlugin::TurboquantAttentionPlugin(int layer_idx, int num_head
 {
     validateBits(turboquantBits);
     TLLM_LOG_INFO(
-        "TurboquantAttentionPlugin constructed (layer=%d, bits=%d). enqueue forwards to GPTAttentionPlugin until "
-        "the K3/K6 hook lands.",
+        "TurboquantAttentionPlugin constructed (layer=%d, bits=%d). K1+K2 streaming round-trip is wired on "
+        "enqueue; persistent cache stays fp16-shaped (B.3b adds packed pool selection).",
         layer_idx, mTurboquantBits);
 }
 
@@ -79,7 +222,6 @@ TurboquantAttentionPlugin::TurboquantAttentionPlugin(void const* data, size_t le
     : GPTAttentionPlugin(data, length - sizeof(int))
     , mTurboquantBits(0)
 {
-    // Trailing int after the parent's serialized payload.
     auto const* tail = static_cast<char const*>(data) + length - sizeof(int);
     std::memcpy(&mTurboquantBits, tail, sizeof(int));
     validateBits(mTurboquantBits);
@@ -89,27 +231,81 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
-    // v1: telemetry only — log the first invocation and forward to parent.
-    // This proves PluginConfig.turboquant_attention_plugin actually routes
-    // through our class at inference time. The K1/K2 round-trip math hook
-    // lands in B.2.1b after the kernel sources are vendored.
+    // K1 + K2 streaming round-trip on the fused QKV tensor (inputs[0]).
+    // Treats the whole QKV as [n_tokens, n_total_heads, d_head] — Q heads
+    // get quantized too, which adds bounded drift but doesn't change
+    // attention math correctness. B.2.1c carves Q out.
+    //
+    // Persistent KV cache (the inner GPTAttentionPlugin's write into the
+    // KVCacheManager-allocated pool) sees the round-tripped K/V — so the
+    // cache holds post-compression numerics, exactly like Phase A
+    // (M12.3) but in-tree.
+    auto const& qkvDesc = inputDesc[0];
+    if (qkvDesc.dims.nbDims < 2 || qkvDesc.type != nvinfer1::DataType::kHALF)
+    {
+        // Not fp16 / not a 2D-or-higher tensor — bail to parent.
+        return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+    }
+
+    int qkvDim = qkvDesc.dims.d[qkvDesc.dims.nbDims - 1];
+    int nTokens = 1;
+    for (int i = 0; i < qkvDesc.dims.nbDims - 1; ++i)
+    {
+        nTokens *= qkvDesc.dims.d[i];
+    }
+    if (qkvDim % kDHead != 0)
+    {
+        return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+    }
+    int nTotalHeads = qkvDim / kDHead;
+
+    if (!gQuantState.initOnce(mTurboquantBits))
+    {
+        TLLM_LOG_ERROR("TurboquantAttentionPlugin::enqueue: DeviceQuantState init failed (bits=%d)", mTurboquantBits);
+        return -1;
+    }
+
+    if (!ensureWorkspace(mWorkspace, nTokens, nTotalHeads, kDHead, mTurboquantBits))
+    {
+        TLLM_LOG_ERROR("TurboquantAttentionPlugin::enqueue: workspace alloc failed (nTokens=%d, nHeads=%d)", nTokens,
+            nTotalHeads);
+        return -1;
+    }
+
+    int err = tq_kv_quantize_streaming(inputs[0], gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
+        mWorkspace.packed, mWorkspace.norms, mTurboquantBits, kDtypeFP16, nTokens, nTotalHeads, kDHead, stream);
+    if (err != 0)
+    {
+        TLLM_LOG_ERROR("TurboquantAttentionPlugin: tq_kv_quantize_streaming returned %d", err);
+        return -1;
+    }
+    err = tq_kv_dequantize_streaming(mWorkspace.packed, mWorkspace.norms, gQuantState.signs, gQuantState.centroids,
+        mWorkspace.kv_out, mTurboquantBits, kDtypeFP16, nTokens, nTotalHeads, kDHead, stream);
+    if (err != 0)
+    {
+        TLLM_LOG_ERROR("TurboquantAttentionPlugin: tq_kv_dequantize_streaming returned %d", err);
+        return -1;
+    }
+
     static std::atomic<bool> sLogged{false};
     bool expected = false;
     if (sLogged.compare_exchange_strong(expected, true))
     {
-        int nbDims = inputDesc[0].dims.nbDims;
-        int qkvDim = nbDims > 0 ? inputDesc[0].dims.d[nbDims - 1] : 0;
-        int nTokens = 1;
-        for (int i = 0; i < nbDims - 1; ++i)
-        {
-            nTokens *= inputDesc[0].dims.d[i];
-        }
         TLLM_LOG_INFO(
-            "TurboquantAttentionPlugin::enqueue#1 — bits=%d nTokens=%d qkvDim=%d dtype=%d. "
-            "Math hook is OFF in this build (B.2.1b will add K1/K2 round-trip).",
-            mTurboquantBits, nTokens, qkvDim, static_cast<int>(inputDesc[0].type));
+            "TurboquantAttentionPlugin::enqueue#1 — K1+K2 round-trip applied: bits=%d nTokens=%d nTotalHeads=%d "
+            "d_head=%d",
+            mTurboquantBits, nTokens, nTotalHeads, kDHead);
     }
-    return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+
+    // Patch inputs[0] to our round-tripped buffer, forward to parent.
+    constexpr int kMaxInputs = 64;
+    void const* patchedInputs[kMaxInputs] = {nullptr};
+    for (int i = 0; i < kMaxInputs; ++i)
+    {
+        patchedInputs[i] = inputs[i];
+    }
+    patchedInputs[0] = mWorkspace.kv_out;
+    return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, patchedInputs, outputs, workspace, stream);
 }
 
 char const* TurboquantAttentionPlugin::getPluginType() const noexcept
@@ -124,8 +320,6 @@ char const* TurboquantAttentionPlugin::getPluginVersion() const noexcept
 
 TurboquantAttentionPlugin* TurboquantAttentionPlugin::clone() const noexcept
 {
-    // Round-trip via serialize/deserialize so every parent member
-    // (including private state in GPTAttentionPluginCommon) is preserved.
     auto const size = getSerializationSize();
     std::vector<char> buffer(size);
     serialize(buffer.data());
@@ -146,6 +340,12 @@ void TurboquantAttentionPlugin::serialize(void* buffer) const noexcept
     std::memcpy(tail, &mTurboquantBits, sizeof(int));
 }
 
+void TurboquantAttentionPlugin::destroy() noexcept
+{
+    mWorkspace.free();
+    GPTAttentionPlugin::destroy();
+}
+
 //
 // Creator
 //
@@ -153,7 +353,6 @@ void TurboquantAttentionPlugin::serialize(void* buffer) const noexcept
 TurboquantAttentionPluginCreator::TurboquantAttentionPluginCreator()
     : GPTAttentionPluginCreator()
 {
-    // Start from the parent's field set and append our `bits` knob.
     auto const* parentFC = GPTAttentionPluginCreator::getFieldNames();
     if (parentFC != nullptr)
     {
@@ -163,7 +362,8 @@ TurboquantAttentionPluginCreator::TurboquantAttentionPluginCreator()
             mPluginAttributes.push_back(parentFC->fields[i]);
         }
     }
-    mPluginAttributes.emplace_back(nvinfer1::PluginField{"turboquant_bits", nullptr, nvinfer1::PluginFieldType::kINT32, 1});
+    mPluginAttributes.emplace_back(
+        nvinfer1::PluginField{"turboquant_bits", nullptr, nvinfer1::PluginFieldType::kINT32, 1});
     mFC.nbFields = static_cast<int32_t>(mPluginAttributes.size());
     mFC.fields = mPluginAttributes.data();
 }
@@ -186,10 +386,6 @@ nvinfer1::PluginFieldCollection const* TurboquantAttentionPluginCreator::getFiel
 nvinfer1::IPluginV2* TurboquantAttentionPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
 {
-    // Delegate the bulk of the parsing to GPTAttentionPluginCreator by
-    // constructing a parent and then deserializing it through our
-    // own ctor. Simpler than duplicating the ~50-field PluginFieldParser
-    // wall here, and bit-identical to what the parent would do.
     auto* parent = static_cast<GPTAttentionPlugin*>(GPTAttentionPluginCreator::createPlugin(name, fc));
     if (parent == nullptr)
     {

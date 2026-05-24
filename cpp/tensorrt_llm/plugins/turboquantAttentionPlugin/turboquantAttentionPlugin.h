@@ -18,8 +18,28 @@
 
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
 
+#include <cstddef>
+
 namespace tensorrt_llm::plugins
 {
+
+// Per-plugin lazy-allocated GPU workspace for the K1/K2 streaming
+// round-trip. Grown on demand, freed in destroy(). Inline here so
+// the .cpp can include it without exposing CUDA types in the public
+// header.
+struct TurboquantEnqueueWorkspace
+{
+    void* packed{nullptr};
+    float* norms{nullptr};
+    void* kv_out{nullptr};
+    std::size_t packed_capacity{0};
+    std::size_t norms_capacity{0};
+    std::size_t kv_out_capacity{0};
+
+    // Frees all three buffers. Safe to call multiple times. Defined
+    // in the .cpp to keep CUDA includes out of the header.
+    void free();
+};
 
 // TurboquantAttentionPlugin: in-tree successor to the Phase A drop-in
 // adapter at engines/trtllm/cpp/. Subclasses GPTAttentionPlugin so we
@@ -80,6 +100,9 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
 
+    // IPluginV2 — release workspace + parent state.
+    void destroy() noexcept override;
+
     [[nodiscard]] int getTurboquantBits() const noexcept
     {
         return mTurboquantBits;
@@ -87,6 +110,7 @@ public:
 
 private:
     int mTurboquantBits;
+    TurboquantEnqueueWorkspace mWorkspace{};
 };
 
 class TurboquantAttentionPluginCreator : public GPTAttentionPluginCreator
