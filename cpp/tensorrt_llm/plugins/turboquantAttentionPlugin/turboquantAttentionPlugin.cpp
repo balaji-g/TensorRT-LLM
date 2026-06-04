@@ -421,6 +421,7 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             int poolIdxForLayer = hMapping[this->mLayerIdx * 2 + 0];
             int relativeLayer = hMapping[this->mLayerIdx * 2 + 1];
             int nPools = inputDesc[poolPtrsIdx].dims.d[0];
+            (void)nPools;
             int kvFactor = 2;
             // pool_ptrs shape [n_pools, 2]; primary at index 0.
             std::uintptr_t poolRaw
@@ -669,12 +670,16 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         std::vector<std::int32_t> hSlotK(nTokens), hSlotV(nTokens);
         std::set<std::int32_t> kBlocksSet, vBlocksSet;
         int const s = 0;
-        int const seqPast = (batchSize > 0) ? hPastKv[s] : 0;
-        int const seqTotal = seqPast + nTokens;
-        int const nFullBlocks = (seqTotal + kTokensPerBlockB22 - 1) / kTokensPerBlockB22;
+        // TRT-LLM batch manager sets HOST_PAST_KEY_VALUE_LENGTHS to
+        // (beginCompute + inputLength) — the *after-this-step* total
+        // for the sequence (runtimeBuffers.cpp:549). The new tokens
+        // are written to slots [pastBefore .. pastBefore + nTokens - 1].
+        int const seqTotalAfter = (batchSize > 0) ? hPastKv[s] : nTokens;
+        int const seqPastBefore = seqTotalAfter - nTokens;
+        int const nFullBlocks = (seqTotalAfter + kTokensPerBlockB22 - 1) / kTokensPerBlockB22;
         for (int t = 0; t < nTokens; ++t)
         {
-            int absPos = seqPast + t;
+            int absPos = seqPastBefore + t;
             int blockInSeq = absPos / kTokensPerBlockB22;
             int offInBlock = absPos - blockInSeq * kTokensPerBlockB22;
             int physK
@@ -809,10 +814,10 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 {
                     TLLM_LOG_INFO(
                         "[B.2.2] step 9b ON (layer=%d): K3+K6+scratch+patch active. "
-                        "nTokens=%d seqPast=%d nFullBlocks=%d kBlocks=%zu vBlocks=%zu maxBlockId=%d "
-                        "scratchPoolBytes=%zu",
-                        this->mLayerIdx, nTokens, seqPast, nFullBlocks, kBlockList.size(), vBlockList.size(),
-                        maxBlockId, scratchPoolBytes);
+                        "nTokens=%d pastBefore=%d totalAfter=%d nFullBlocks=%d kBlocks=%zu vBlocks=%zu "
+                        "maxBlockId=%d scratchPoolBytes=%zu",
+                        this->mLayerIdx, nTokens, seqPastBefore, seqTotalAfter, nFullBlocks, kBlockList.size(),
+                        vBlockList.size(), maxBlockId, scratchPoolBytes);
                 }
             }
         }
