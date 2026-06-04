@@ -44,4 +44,26 @@ int tq_kv_dequantize_streaming(void const* d_packed, float const* d_norms, int8_
     float const* d_centroids, void* d_kv_out, int bits, int dtype, int n_tokens, int n_heads, int d_head,
     void* stream);
 
+// `layout` argument for the paged kernels:
+//   0 = TQ_LAYOUT_VLLM_BLOCKED          — separate packed/norms buffers.
+//   2 = TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS  — single buffer per block,
+//       [ packed_section ][ norms_section ]; caller passes
+//       d_packed_cache = pool_base and d_norms_cache =
+//       pool_base + packed_section_bytes.
+//       packed_section_bytes = n_kv_heads * block_size * d_head * bits / 8
+//       This matches TurboquantKVCacheManager (M12.4 B.1.1).
+
+// K3 — paged quantize. Writes one K (or one V) tensor through
+// slot_mapping. `entry < 0` in slot_mapping skips that token.
+int tq_kv_quantize_paged(void const* d_kv, int32_t const* d_slot_mapping, void* d_packed_cache,
+    float* d_norms_cache, int8_t const* d_signs, float const* d_centroids, float const* d_thresholds, int bits,
+    int dtype, int layout, int n_tokens, int n_kv_heads, int d_head, int n_blocks, int block_size, void* stream);
+
+// K6 — paged dequantize. Gathers blocks listed in d_physical_block_ids
+// into a contiguous scratch tensor
+// `[n_scratch_blocks, n_kv_heads, block_size, d_head]`.
+int tq_kv_dequantize_paged(void const* d_packed_cache, float const* d_norms_cache, int32_t const* d_physical_block_ids,
+    int8_t const* d_signs, float const* d_centroids, void* d_scratch_out, int bits, int dtype, int layout,
+    int n_scratch_blocks, int n_kv_heads, int d_head, int block_size, void* stream);
+
 } // extern "C"

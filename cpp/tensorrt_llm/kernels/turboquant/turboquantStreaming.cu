@@ -473,6 +473,18 @@ enum tq_paged_layout : int {
     // dead code; adding it as a stub would violate the "no cheap
     // tricks" rule the kernels-v1 contract was written under.
     // TQ_LAYOUT_TRTLLM_PAGED = 1,
+    // M12.4 B.2.2 — Option A inline-norms layout, used by the
+    // TurboquantKVCacheManager subclass in the TRT-LLM fork (see
+    // docs/trtllm-cpp-design.md §4.2). Each per-(block, layer, K-or-V)
+    // slot stores the packed bytes for all heads, then the fp32 norm
+    // for all heads contiguously:
+    //   block_layout = [ n_kv_heads * block_size * packed_bytes_per_head bytes
+    //                  | n_kv_heads * block_size * sizeof(float)    bytes ]
+    // Callers pass d_packed_cache = pool_base and d_norms_cache =
+    // pool_base + packed_section_bytes; this case computes strides
+    // that walk the FULL per-block stride (packed + norms) on the
+    // block-step axis.
+    TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS = 2,
 };
 
 template <int BITS, typename T>
@@ -649,6 +661,27 @@ cudaError_t launch_paged_quantize(
             norms_head_stride   = block_size;
             norms_slot_stride   = 1;
             break;
+        case TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS: {
+            // Per-(block, K-or-V) layout in a single buffer:
+            //   [ packed_section ][ norms_section ]
+            //   packed_section: n_kv_heads * block_size * packed_bytes_per_head bytes
+            //   norms_section:  n_kv_heads * block_size * sizeof(float)         bytes
+            // Caller passes:
+            //   d_packed_cache = pool_base
+            //   d_norms_cache  = pool_base + packed_section_bytes
+            // Strides walk the FULL block on the block axis so block-N's
+            // packed + norms regions land at the right address.
+            int const packed_section_bytes = n_kv_heads * block_size * packed_bytes_per_head;
+            int const norms_section_bytes  = n_kv_heads * block_size * (int)sizeof(float);
+            int const total_block_bytes    = packed_section_bytes + norms_section_bytes;
+            packed_block_stride = total_block_bytes;
+            packed_head_stride  = block_size * packed_bytes_per_head;
+            packed_slot_stride  = packed_bytes_per_head;
+            norms_block_stride  = total_block_bytes / (int)sizeof(float);
+            norms_head_stride   = block_size;
+            norms_slot_stride   = 1;
+            break;
+        }
         default:
             return cudaErrorInvalidValue;
     }
@@ -845,6 +878,21 @@ cudaError_t launch_paged_dequantize(
             norms_kv_head_stride  = block_size;
             norms_slot_stride     = 1;
             break;
+        case TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS: {
+            // Mirror of launch_paged_quantize's inline-norms case. See
+            // that comment for layout. Caller passes d_packed_cache =
+            // pool_base, d_norms_cache = pool_base + packed_section_bytes.
+            int const packed_section_bytes = n_kv_heads * block_size * packed_bytes_per_head;
+            int const norms_section_bytes  = n_kv_heads * block_size * (int)sizeof(float);
+            int const total_block_bytes    = packed_section_bytes + norms_section_bytes;
+            packed_block_stride   = total_block_bytes;
+            packed_kv_head_stride = block_size * packed_bytes_per_head;
+            packed_slot_stride    = packed_bytes_per_head;
+            norms_block_stride    = total_block_bytes / (int)sizeof(float);
+            norms_kv_head_stride  = block_size;
+            norms_slot_stride     = 1;
+            break;
+        }
         default:
             return cudaErrorInvalidValue;
     }
