@@ -296,6 +296,80 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             "d_head=%d",
             mTurboquantBits, nTokens, nTotalHeads, kDHead);
 
+        // B.2.2 sanity ping — K3 (paged write) + K6 (paged read) with
+        // TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS. Allocates a small
+        // shadow pool sized for nTokens slots (heuristic block_size=32),
+        // packs the QKV via K3 then reads back via K6. Just verifies
+        // the kernel API is wired and the inline-norms layout doesn't
+        // segfault. Byte-equality check vs K1+K2 is the next-session
+        // milestone. No HBM savings here — shadow pool is freed at the
+        // end of this once-only block.
+        constexpr int kTokensPerBlock = 32;
+        int const nBlocks = (nTokens + kTokensPerBlock - 1) / kTokensPerBlock;
+        int const packedBytesPerHead = kDHead * mTurboquantBits / 8;
+        int const packedSectionBytes = nTotalHeads * kTokensPerBlock * packedBytesPerHead;
+        int const normsSectionBytes = nTotalHeads * kTokensPerBlock * static_cast<int>(sizeof(float));
+        int const totalBlockBytes = packedSectionBytes + normsSectionBytes;
+        std::size_t const poolBytes = static_cast<std::size_t>(nBlocks) * totalBlockBytes;
+
+        void* shadowPool = nullptr;
+        int32_t* slotMapping = nullptr;
+        int32_t* physBlocks = nullptr;
+        void* k6Scratch = nullptr;
+        std::size_t const k6ScratchBytes = static_cast<std::size_t>(nBlocks) * nTotalHeads * kTokensPerBlock * kDHead
+            * sizeof(std::uint16_t);
+        bool sanityOk = true;
+        if (cudaMalloc(&shadowPool, poolBytes) != cudaSuccess)
+            sanityOk = false;
+        if (sanityOk && cudaMalloc(&slotMapping, nTokens * sizeof(int32_t)) != cudaSuccess)
+            sanityOk = false;
+        if (sanityOk && cudaMalloc(&physBlocks, nBlocks * sizeof(int32_t)) != cudaSuccess)
+            sanityOk = false;
+        if (sanityOk && cudaMalloc(&k6Scratch, k6ScratchBytes) != cudaSuccess)
+            sanityOk = false;
+
+        if (sanityOk)
+        {
+            cudaMemsetAsync(shadowPool, 0, poolBytes, stream);
+            // Identity slot mapping: token i → slot i in block i/32.
+            std::vector<int32_t> hSlot(nTokens);
+            for (int i = 0; i < nTokens; ++i)
+                hSlot[i] = i;
+            cudaMemcpyAsync(slotMapping, hSlot.data(), nTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+            std::vector<int32_t> hPhys(nBlocks);
+            for (int i = 0; i < nBlocks; ++i)
+                hPhys[i] = i;
+            cudaMemcpyAsync(physBlocks, hPhys.data(), nBlocks * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+
+            // K3 inline-norms layout: packed = pool_base, norms = pool_base + packed_section.
+            constexpr int kLayoutInlineNorms = 2; // TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS
+            int rc3 = tq_kv_quantize_paged(inputs[0], slotMapping, shadowPool,
+                reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(shadowPool) + packedSectionBytes),
+                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
+                kLayoutInlineNorms, nTokens, nTotalHeads, kDHead, nBlocks, kTokensPerBlock, stream);
+            int rc6 = tq_kv_dequantize_paged(shadowPool,
+                reinterpret_cast<float const*>(reinterpret_cast<uint8_t*>(shadowPool) + packedSectionBytes), physBlocks,
+                gQuantState.signs, gQuantState.centroids, k6Scratch, mTurboquantBits, kDtypeFP16, kLayoutInlineNorms,
+                nBlocks, nTotalHeads, kDHead, kTokensPerBlock, stream);
+            cudaError_t syncErr = cudaStreamSynchronize(stream);
+            TLLM_LOG_INFO(
+                "[B.2.2] K3+K6 inline-norms sanity: rc3=%d rc6=%d cudaSync=%d (nBlocks=%d, "
+                "poolBytes=%zu, k6Scratch=%zu)",
+                rc3, rc6, static_cast<int>(syncErr), nBlocks, poolBytes, k6ScratchBytes);
+        }
+        else
+        {
+            TLLM_LOG_ERROR("[B.2.2] K3+K6 sanity: cudaMalloc failed");
+        }
+        if (shadowPool)
+            cudaFree(shadowPool);
+        if (slotMapping)
+            cudaFree(slotMapping);
+        if (physBlocks)
+            cudaFree(physBlocks);
+        if (k6Scratch)
+            cudaFree(k6Scratch);
+
         // B.2.2 reconnaissance — log the input tensor descriptors we'll
         // need for K3/K6 paged write/read. Fires once globally; cheap.
         auto logTensor = [&](char const* label, IdxEntry e) {
