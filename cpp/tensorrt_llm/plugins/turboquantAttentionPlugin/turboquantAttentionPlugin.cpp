@@ -295,6 +295,40 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             "TurboquantAttentionPlugin::enqueue#1 — K1+K2 round-trip applied: bits=%d nTokens=%d nTotalHeads=%d "
             "d_head=%d",
             mTurboquantBits, nTokens, nTotalHeads, kDHead);
+
+        // B.2.2 reconnaissance — log the input tensor descriptors we'll
+        // need for K3/K6 paged write/read. Fires once globally; cheap.
+        auto logTensor = [&](char const* label, IdxEntry e) {
+            if (!isEntryUsed(e))
+            {
+                TLLM_LOG_INFO("[B.2.2] %s: <not used>", label);
+                return;
+            }
+            auto idx = getIdx(e);
+            auto const& d = inputDesc[idx];
+            int totalElems = 1;
+            char dimsStr[128];
+            int n = 0;
+            for (int i = 0; i < d.dims.nbDims; ++i)
+            {
+                int dim = d.dims.d[i];
+                totalElems *= dim;
+                n += snprintf(dimsStr + n, sizeof(dimsStr) - n, "%s%d", (i == 0 ? "" : "x"), dim);
+                if (n >= static_cast<int>(sizeof(dimsStr)))
+                    break;
+            }
+            TLLM_LOG_INFO("[B.2.2] %s idx=%d shape=%s dtype=%d totalElems=%d", label, idx, dimsStr,
+                static_cast<int>(d.type), totalElems);
+        };
+        logTensor("QKV_TENSOR", IdxEntry::QKV_TENSOR);
+        logTensor("SEQUENCE_LENGTH", IdxEntry::SEQUENCE_LENGTH);
+        logTensor("HOST_PAST_KEY_VALUE_LENGTHS", IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS);
+        logTensor("CONTEXT_LENGTHS", IdxEntry::CONTEXT_LENGTHS);
+        logTensor("REQUEST_TYPES", IdxEntry::REQUEST_TYPES);
+        logTensor("KV_CACHE_BLOCK_OFFSETS", IdxEntry::KV_CACHE_BLOCK_OFFSETS);
+        logTensor("HOST_KV_CACHE_BLOCK_OFFSETS", IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS);
+        logTensor("HOST_KV_CACHE_POOL_POINTERS", IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
+        logTensor("HOST_KV_CACHE_POOL_MAPPING", IdxEntry::HOST_KV_CACHE_POOL_MAPPING);
     }
 
     // Patch inputs[0] to our round-tripped buffer, forward to parent.

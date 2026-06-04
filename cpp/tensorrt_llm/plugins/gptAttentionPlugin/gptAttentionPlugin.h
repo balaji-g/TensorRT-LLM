@@ -171,12 +171,13 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
 
-private:
-    template <typename T, typename AttentionOutT, typename KVCacheBuffer>
-    int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
-        nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
-
+protected:
+    // Exposed to subclasses (TurboquantAttentionPlugin) so they can
+    // resolve the same per-input tensor indices as the parent without
+    // duplicating initEntryIdx. The enum + helpers were originally
+    // private; this is the minimum visibility bump needed to support
+    // a parallel plugin variant that needs to read HOST_KV_CACHE_POOL_
+    // POINTERS / KV_CACHE_BLOCK_OFFSETS at enqueue time.
     using IndexType = std::int32_t;
 
     std::vector<size_t> mEntryIdx;
@@ -234,6 +235,12 @@ private:
     bool isEntryUsed(IdxEntry const& entry) const;
     void initEntryIdx();
     IndexType getIdx(IdxEntry const& entry) const;
+
+private:
+    template <typename T, typename AttentionOutT, typename KVCacheBuffer>
+    int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
+        nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
     // Get generation input sequence length (might be larger than 1 in the speculative decoding mode).
     int getGenerationInputSequenceLength(
