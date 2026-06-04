@@ -573,6 +573,34 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         patchedInputs[i] = inputs[i];
     }
     patchedInputs[0] = mWorkspace.kv_out;
+
+    // B.2.2 step 9a — pool-pointer patch dry run. Copies
+    // HOST_KV_CACHE_POOL_POINTERS into a stack-local host buffer with
+    // identical values and patches the inputs array to point at the
+    // copy. Generation must continue byte-for-byte unchanged since the
+    // pointer values are the same; this just validates the patch
+    // machinery so the next session can replace the copy with a
+    // scratch ptr that holds K6-dequantized data.
+    //
+    // Pool pointers tensor shape [n_pools, 2] of int64; n_pools is
+    // typically 1 for Llama-3. Bounded array size accommodates up to
+    // 8 pools.
+    std::int64_t hPoolPtrsCopy[16] = {0};
+    if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS))
+    {
+        auto poolPtrsIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
+        auto const& d = inputDesc[poolPtrsIdx];
+        int totalElems = 1;
+        for (int i = 0; i < d.dims.nbDims; ++i)
+        {
+            totalElems *= d.dims.d[i];
+        }
+        if (totalElems > 0 && totalElems <= static_cast<int>(sizeof(hPoolPtrsCopy) / sizeof(std::int64_t)))
+        {
+            std::memcpy(hPoolPtrsCopy, inputs[poolPtrsIdx], totalElems * sizeof(std::int64_t));
+            patchedInputs[poolPtrsIdx] = hPoolPtrsCopy;
+        }
+    }
     return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, patchedInputs, outputs, workspace, stream);
 }
 
