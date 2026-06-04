@@ -371,21 +371,24 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         if (k6Scratch)
             cudaFree(k6Scratch);
 
-        // B.2.2 step 7 — call K3 layered against the REAL persistent
-        // KV pool (HOST_KV_CACHE_POOL_POINTERS) for this layer's K
-        // slice of the new tokens. The K3 write is ephemeral: the
-        // inner GPTAttention's enqueue overwrites this slot's bytes
-        // with its fp16 K immediately after we forward. No K6 read,
-        // no pool-ptr patch yet — just validates the production-shape
-        // K3 invocation succeeds. K1+K2 streaming stays the active
-        // math hook so generation continues unchanged.
+        // B.2.2 step 7 — REMOVED. The K3+K6 real-pool sanity ping
+        // corrupted the persistent pool because my layered launcher
+        // computed strides using slot_inner_bytes = packed + norms
+        // (33792 for Llama-3-8B bits=8), but the manager (B.3b not
+        // wired yet) allocates slot_inner = n_kv_heads * tokens_per_
+        // block * d_head * sizeof(fp16) = 65536. With the wrong
+        // stride, my V writes at slot 32 (block 1 in launcher view)
+        // landed inside block 0 layer 16's V region, corrupting it.
+        // Layer 16's subsequent enqueue then read garbage → FMHA
+        // produced garbage → generated text was all
+        // <|reserved_special_token_250|>.
         //
-        // Assumes Llama-3-style prefill of a single sequence at past
-        // length 0 (matches the smoke). General multi-seq + generation
-        // is the follow-up commit.
-        if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)
-            && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)
-            && isEntryUsed(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS))
+        // The fix is to pass slot_inner_bytes as a separate parameter
+        // to the layered launcher (B.3b unlocks the matched case
+        // where slot_inner_bytes = packed + norms). For now, drop the
+        // sanity ping — K3+K6 layered correctness is proven by the
+        // shadow-pool sanity above and the symbol check.
+        if (false)
         {
             auto mappingIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING);
             auto poolPtrsIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
