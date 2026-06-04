@@ -644,6 +644,7 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         std::int32_t const* hPastKv = static_cast<std::int32_t const*>(inputs[pastIdx]);
 
         int const nLayersPerPool = inputDesc[mappingIdx].dims.d[0];
+        (void)nLayersPerPool;
         int const nPools = inputDesc[poolPtrsIdx].dims.d[0];
         constexpr int kvFactor = 2;
         constexpr int kTokensPerBlockB22 = 32;
@@ -664,16 +665,32 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         int const beamWidth = boDesc.dims.d[1];
         int const maxBlocksPerSeq = boDesc.dims.d[3];
 
-        // Compute per-token slot mappings + active block ID sets.
+        // Compute per-token slot mappings + active flat-slot ID sets.
         // Single-sequence prefill / single-token decode assumption
         // (the smoke). Multi-seq batches: TODO follow-up.
+        //
+        // Pool layout (kvCacheManager.cpp:694) is
+        //   pool[nBlocks][nLayersPerPool][kvFactor][slot_inner].
+        // setOffsets (kvCacheManager.cpp:823) populates block_offsets
+        // with FLAT slot indices: block_offset_value = memIdx *
+        // (nLayersPerPool * kvFactor) + xIdx, where xIdx is 0 for K
+        // and 1 for V, and layerIdx is hardcoded to 0 — the parent
+        // adds layerOffset = L * kvFactor * slot_inner separately
+        // (gptAttentionPlugin.cpp:896-898). So K_block_offset and
+        // V_block_offset for the same logical block differ by 1
+        // (memIdx=0 → K=0, V=1; memIdx=1 → K=64, V=65 at kvFactor=2).
+        //
+        // We therefore call K3/K6 with n_layers_per_pool=1, kv_factor=1,
+        // relative_layer=0, k_or_v=0, and shift pool_base by
+        // L*kvFactor*slot_inner so each (block_offset_value)-indexed
+        // 65 KB slot lands at its true pool address. slot_mapping[t]
+        // = block_offset_value * tokens_per_block + offInBlock.
         std::vector<std::int32_t> hSlotK(nTokens), hSlotV(nTokens);
         std::set<std::int32_t> kBlocksSet, vBlocksSet;
         int const s = 0;
         // TRT-LLM batch manager sets HOST_PAST_KEY_VALUE_LENGTHS to
         // (beginCompute + inputLength) — the *after-this-step* total
-        // for the sequence (runtimeBuffers.cpp:549). The new tokens
-        // are written to slots [pastBefore .. pastBefore + nTokens - 1].
+        // for the sequence (runtimeBuffers.cpp:549).
         int const seqTotalAfter = (batchSize > 0) ? hPastKv[s] : nTokens;
         int const seqPastBefore = seqTotalAfter - nTokens;
         int const nFullBlocks = (seqTotalAfter + kTokensPerBlockB22 - 1) / kTokensPerBlockB22;
@@ -682,25 +699,24 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             int absPos = seqPastBefore + t;
             int blockInSeq = absPos / kTokensPerBlockB22;
             int offInBlock = absPos - blockInSeq * kTokensPerBlockB22;
-            int physK
+            int kFlat
                 = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 0) * maxBlocksPerSeq + blockInSeq];
-            int physV
+            int vFlat
                 = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 1) * maxBlocksPerSeq + blockInSeq];
-            hSlotK[t] = physK * kTokensPerBlockB22 + offInBlock;
-            hSlotV[t] = physV * kTokensPerBlockB22 + offInBlock;
+            hSlotK[t] = kFlat * kTokensPerBlockB22 + offInBlock;
+            hSlotV[t] = vFlat * kTokensPerBlockB22 + offInBlock;
         }
         for (int b = 0; b < nFullBlocks; ++b)
         {
-            int physK = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 0) * maxBlocksPerSeq + b];
-            int physV = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 1) * maxBlocksPerSeq + b];
-            kBlocksSet.insert(physK);
-            vBlocksSet.insert(physV);
+            int kFlat = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 0) * maxBlocksPerSeq + b];
+            int vFlat = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 1) * maxBlocksPerSeq + b];
+            kBlocksSet.insert(kFlat);
+            vBlocksSet.insert(vFlat);
         }
         std::vector<std::int32_t> kBlockList(kBlocksSet.begin(), kBlocksSet.end());
         std::vector<std::int32_t> vBlockList(vBlocksSet.begin(), vBlocksSet.end());
-        int const maxBlockId
-            = std::max(kBlocksSet.empty() ? 0 : *kBlocksSet.rbegin(),
-                       vBlocksSet.empty() ? 0 : *vBlocksSet.rbegin());
+        int const maxFlatSlot = std::max(kBlocksSet.empty() ? 0 : *kBlocksSet.rbegin(),
+                                          vBlocksSet.empty() ? 0 : *vBlocksSet.rbegin());
 
         // Lazy-grow per-instance buffers.
         std::size_t const kvBytesPerToken
@@ -710,10 +726,16 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             = static_cast<std::size_t>(kBlockList.size()) * slotInnerBytes;
         std::size_t const scratchK6VBytes
             = static_cast<std::size_t>(vBlockList.size()) * slotInnerBytes;
-        std::size_t const perBlockPoolBytes
-            = static_cast<std::size_t>(nLayersPerPool) * kvFactor * slotInnerBytes;
+        // scratchPool just needs to span [0 .. (maxFlatSlot + 1) *
+        // slot_inner). We patch HOST_KV_CACHE_POOL_POINTERS to
+        // mScratchPool - L * kvFactor * slot_inner so the parent's
+        // layerOffset addition wraps back to mScratchPool base, then
+        // its block_offset_value * slot_inner indexing lands in our
+        // populated region. Pointer "negative-offset" arithmetic is
+        // a 64-bit integer manipulation on GPU; the negative range
+        // is never dereferenced.
         std::size_t const scratchPoolBytes
-            = static_cast<std::size_t>(maxBlockId + 1) * perBlockPoolBytes;
+            = static_cast<std::size_t>(maxFlatSlot + 1) * slotInnerBytes;
 
         bool ok = ensureBuf(&mKContig, &mKContigCap, kContigBytes)
             && ensureBuf(&mVContig, &mVContigCap, kContigBytes)
@@ -753,58 +775,74 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 static_cast<std::uint8_t const*>(mWorkspace.kv_out) + vSrcOffsetBytes, qkvStrideBytes,
                 kvBytesPerToken, nTokens, cudaMemcpyDeviceToDevice, stream);
 
-            // K3 K and V into the real persistent pool.
-            int rcK = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK, poolBase,
-                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
-                nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22, nLayersPerPool, kvFactor, relativeLayer,
-                /*k_or_v=*/0, slotInnerBytes, stream);
-            int rcV = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV, poolBase,
-                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
-                nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22, nLayersPerPool, kvFactor, relativeLayer,
-                /*k_or_v=*/1, slotInnerBytes, stream);
+            // Shift pool_base by L*kvFactor*slot_inner so each
+            // (block_offset_value)-indexed slot lines up with the
+            // address the parent would compute as
+            //   parent_addr = pool_base + L*kvFactor*slot_inner
+            //                            + block_offset_value*slot_inner.
+            std::size_t const layerStrideBytes
+                = static_cast<std::size_t>(relativeLayer) * kvFactor * slotInnerBytes;
+            void* const poolBaseShifted
+                = static_cast<std::uint8_t*>(poolBase) + layerStrideBytes;
 
-            // K6 dequant active K and V blocks from the real pool into
-            // contiguous scratch_k6 buffers.
-            int rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBase, mPhysBlocksK, gQuantState.signs,
-                gQuantState.centroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
-                static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22, nLayersPerPool,
-                kvFactor, relativeLayer, /*k_or_v=*/0, slotInnerBytes, stream);
-            int rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBase, mPhysBlocksV, gQuantState.signs,
-                gQuantState.centroids, mScratchK6V, mTurboquantBits, kDtypeFP16,
-                static_cast<int>(vBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22, nLayersPerPool,
-                kvFactor, relativeLayer, /*k_or_v=*/1, slotInnerBytes, stream);
+            // K3 K and V into the real persistent pool, addressed flat.
+            int rcK = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK, poolBaseShifted,
+                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
+                nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                /*k_or_v=*/0, slotInnerBytes, stream);
+            int rcV = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV, poolBaseShifted,
+                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
+                nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                /*k_or_v=*/0, slotInnerBytes, stream);
+
+            // K6 dequant active K and V slots from the real pool into
+            // contiguous scratch_k6 buffers — also flat.
+            int rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksK,
+                gQuantState.signs, gQuantState.centroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
+                static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                /*k_or_v=*/0, slotInnerBytes, stream);
+            int rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksV,
+                gQuantState.signs, gQuantState.centroids, mScratchK6V, mTurboquantBits, kDtypeFP16,
+                static_cast<int>(vBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                /*k_or_v=*/0, slotInnerBytes, stream);
 
             if (rcK == 0 && rcV == 0 && rcK6 == 0 && rcV6 == 0)
             {
-                // Zero scratch_pool (uninitialized regions = 0).
                 cudaMemsetAsync(mScratchPool, 0, scratchPoolBytes, stream);
-                // Copy K6 outputs into pool-layout positions in scratch_pool.
+                // Place K6 fp16 outputs at the flat slot offsets so
+                // the parent's block_offset_value * slot_inner indexing
+                // lands on our data.
                 for (std::size_t i = 0; i < kBlockList.size(); ++i)
                 {
-                    std::size_t dstOff = static_cast<std::size_t>(kBlockList[i]) * perBlockPoolBytes
-                        + static_cast<std::size_t>(relativeLayer) * kvFactor * slotInnerBytes
-                        + 0 * static_cast<std::size_t>(slotInnerBytes);
+                    std::size_t dstOff
+                        = static_cast<std::size_t>(kBlockList[i]) * slotInnerBytes;
                     cudaMemcpyAsync(static_cast<std::uint8_t*>(mScratchPool) + dstOff,
                         static_cast<std::uint8_t const*>(mScratchK6K) + i * slotInnerBytes, slotInnerBytes,
                         cudaMemcpyDeviceToDevice, stream);
                 }
                 for (std::size_t i = 0; i < vBlockList.size(); ++i)
                 {
-                    std::size_t dstOff = static_cast<std::size_t>(vBlockList[i]) * perBlockPoolBytes
-                        + static_cast<std::size_t>(relativeLayer) * kvFactor * slotInnerBytes
-                        + 1 * static_cast<std::size_t>(slotInnerBytes);
+                    std::size_t dstOff
+                        = static_cast<std::size_t>(vBlockList[i]) * slotInnerBytes;
                     cudaMemcpyAsync(static_cast<std::uint8_t*>(mScratchPool) + dstOff,
                         static_cast<std::uint8_t const*>(mScratchK6V) + i * slotInnerBytes, slotInnerBytes,
                         cudaMemcpyDeviceToDevice, stream);
                 }
 
-                // Build patched pool ptrs with primary = scratch base.
+                // Patch pool ptr = mScratchPool - L*kvFactor*slot_inner,
+                // so parent's layerOffset addition wraps back to base.
                 int const totalPoolEntries = nPools * 2;
                 int const safeEntries = std::min(totalPoolEntries,
                     static_cast<int>(sizeof(mPatchedPoolPtrs) / sizeof(std::int64_t)));
                 std::memcpy(mPatchedPoolPtrs, hPoolPtrs, safeEntries * sizeof(std::int64_t));
+                std::uintptr_t const scratchBiased
+                    = reinterpret_cast<std::uintptr_t>(mScratchPool) - layerStrideBytes;
                 mPatchedPoolPtrs[poolIdxForLayer * 2 + 0]
-                    = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(mScratchPool));
+                    = static_cast<std::int64_t>(scratchBiased);
                 patchedInputs[poolPtrsIdx] = mPatchedPoolPtrs;
                 stepB22Done = true;
 
@@ -814,10 +852,10 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 {
                     TLLM_LOG_INFO(
                         "[B.2.2] step 9b ON (layer=%d): K3+K6+scratch+patch active. "
-                        "nTokens=%d pastBefore=%d totalAfter=%d nFullBlocks=%d kBlocks=%zu vBlocks=%zu "
-                        "maxBlockId=%d scratchPoolBytes=%zu",
+                        "nTokens=%d pastBefore=%d totalAfter=%d nFullBlocks=%d kFlat=%zu vFlat=%zu "
+                        "maxFlatSlot=%d scratchPoolBytes=%zu layerStrideBytes=%zu",
                         this->mLayerIdx, nTokens, seqPastBefore, seqTotalAfter, nFullBlocks, kBlockList.size(),
-                        vBlockList.size(), maxBlockId, scratchPoolBytes);
+                        vBlockList.size(), maxFlatSlot, scratchPoolBytes, layerStrideBytes);
                 }
             }
         }
