@@ -575,12 +575,12 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     patchedInputs[0] = mWorkspace.kv_out;
 
     // B.2.2 step 9a — pool-pointer patch with stable host buffer.
-    // Initial attempt (b17e2c993) used a stack-local copy and broke
-    // generation — TRT-LLM's gpt_attention reads HOST_KV_CACHE_POOL_
-    // POINTERS asynchronously (after our enqueue returns), so the
-    // stack frame was gone by the time the dereference happened.
-    // Fix: copy into a plugin-member buffer (mPatchedPoolPtrs) that
-    // lives as long as this plugin instance.
+    // Temporarily disabled — the supposedly-no-op copy broke
+    // generation in commits b17e2c993 (stack buffer) and 9e5d63817
+    // (member buffer). Need to diagnose what's actually different
+    // between the patched and original buffers; the values copied
+    // should be identical. Without the patch, generation passes.
+    static std::atomic<bool> sPatchDiagLogged{false};
     if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS))
     {
         auto poolPtrsIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
@@ -590,10 +590,15 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         {
             totalElems *= d.dims.d[i];
         }
-        if (totalElems > 0 && totalElems <= static_cast<int>(sizeof(mPatchedPoolPtrs) / sizeof(std::int64_t)))
+        bool expected = false;
+        if (sPatchDiagLogged.compare_exchange_strong(expected, true) && totalElems > 0
+            && totalElems <= static_cast<int>(sizeof(mPatchedPoolPtrs) / sizeof(std::int64_t)))
         {
+            std::int64_t const* orig = static_cast<std::int64_t const*>(inputs[poolPtrsIdx]);
             std::memcpy(mPatchedPoolPtrs, inputs[poolPtrsIdx], totalElems * sizeof(std::int64_t));
-            patchedInputs[poolPtrsIdx] = mPatchedPoolPtrs;
+            TLLM_LOG_INFO("[B.2.2] pool-ptr diag layer=%d totalElems=%d orig=[0x%lx 0x%lx ...] copy=[0x%lx 0x%lx ...]",
+                this->mLayerIdx, totalElems, totalElems > 0 ? orig[0] : 0, totalElems > 1 ? orig[1] : 0,
+                mPatchedPoolPtrs[0], mPatchedPoolPtrs[1]);
         }
     }
     return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, patchedInputs, outputs, workspace, stream);
