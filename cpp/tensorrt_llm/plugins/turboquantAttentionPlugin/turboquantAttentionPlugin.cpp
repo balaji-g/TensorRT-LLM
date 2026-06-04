@@ -629,13 +629,24 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     // K3's persisted value (both round-tripped from the same fresh
     // K/V), so FMHA sees fully round-tripped tokens 0..N.
     bool stepB22Done = false;
-    static bool const sStep9bDisabled = []() {
-        char const* v = std::getenv("TQ_DISABLE_STEP9B");
-        bool disabled = (v != nullptr && v[0] == '1');
-        if (disabled) TLLM_LOG_INFO("[B.2.2] step 9b DISABLED via TQ_DISABLE_STEP9B=1 (K1+K2 only)");
-        return disabled;
+    // step 9b (K3+K6+scratch+patch) is opt-in via TQ_ENABLE_STEP9B=1.
+    // Default: disabled, because the pre-enqueue K3 captures K BEFORE
+    // the parent's RoPE step. The parent's RoPE-applied K then lands
+    // only in scratchPool (ephemeral) and is lost between enqueues —
+    // so on the next decode, K6 dequant returns pre-RoPE K from the
+    // real pool while FMHA expects post-RoPE K, collapsing decode to
+    // a single-token loop ("is is is..."). The fix is post-enqueue
+    // K3 (capture scratchPool's RoPE-applied K back into the real
+    // pool) — pending in B.2.2 stage 2.
+    static bool const sStep9bEnabled = []() {
+        char const* v = std::getenv("TQ_ENABLE_STEP9B");
+        bool enabled = (v != nullptr && v[0] == '1');
+        TLLM_LOG_INFO("[B.2.2] step 9b %s (TQ_ENABLE_STEP9B=%s)",
+                      enabled ? "ENABLED" : "DISABLED (K1+K2 only)",
+                      v ? v : "<unset>");
+        return enabled;
     }();
-    if (!sStep9bDisabled
+    if (sStep9bEnabled
         && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)
         && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)
         && isEntryUsed(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)
