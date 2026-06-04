@@ -952,9 +952,15 @@ extern "C" int tq_kv_quantize_paged_trtllm_layered(
     int            d_head,
     int            tokens_per_block,
     int            n_layers_per_pool,
-    int            kv_factor,        // 2
-    int            relative_layer,   // 0..n_layers_per_pool-1
-    int            k_or_v,           // 0 for K, 1 for V
+    int            kv_factor,         // 2
+    int            relative_layer,    // 0..n_layers_per_pool-1
+    int            k_or_v,            // 0 for K, 1 for V
+    int            slot_inner_bytes,  // pool's actual per-(block, layer, K-or-V) byte stride.
+                                      //   ≤ 0 → derive as packed_section + norms_section (use when
+                                      //        the manager has been told to shrink, B.3b active).
+                                      //   > 0 → caller-supplied (e.g. n_kv_heads * tokens_per_block
+                                      //        * d_head * sizeof(fp16) when the manager still holds
+                                      //        a full-fp16 pool). Must be ≥ packed + norms.
     void*          stream_v
 ) {
     if ((d_head & (d_head - 1)) != 0 || d_head <= 0 || d_head > 1024) return cudaErrorInvalidValue;
@@ -968,9 +974,11 @@ extern "C" int tq_kv_quantize_paged_trtllm_layered(
     int const packed_bytes_per_head  = d_head * bits / 8;
     int const packed_section_bytes   = n_kv_heads * tokens_per_block * packed_bytes_per_head;
     int const norms_section_bytes    = n_kv_heads * tokens_per_block * (int)sizeof(float);
-    int const slot_inner_bytes       = packed_section_bytes + norms_section_bytes;
-    int const per_block_bytes        = n_layers_per_pool * kv_factor * slot_inner_bytes;
-    int const layer_kv_offset_bytes  = (relative_layer * kv_factor + k_or_v) * slot_inner_bytes;
+    int const slot_inner_for_stride
+        = (slot_inner_bytes > 0) ? slot_inner_bytes : (packed_section_bytes + norms_section_bytes);
+    if (slot_inner_for_stride < packed_section_bytes + norms_section_bytes) return cudaErrorInvalidValue;
+    int const per_block_bytes        = n_layers_per_pool * kv_factor * slot_inner_for_stride;
+    int const layer_kv_offset_bytes  = (relative_layer * kv_factor + k_or_v) * slot_inner_for_stride;
 
     uint8_t* layer_k_or_v_packed = static_cast<uint8_t*>(pool_base) + layer_kv_offset_bytes;
     float*   layer_k_or_v_norms  = reinterpret_cast<float*>(layer_k_or_v_packed + packed_section_bytes);
@@ -1039,6 +1047,7 @@ extern "C" int tq_kv_dequantize_paged_trtllm_layered(
     int            kv_factor,
     int            relative_layer,
     int            k_or_v,
+    int            slot_inner_bytes,  // see tq_kv_quantize_paged_trtllm_layered comment
     void*          stream_v
 ) {
     if ((d_head & (d_head - 1)) != 0 || d_head <= 0 || d_head > 1024) return cudaErrorInvalidValue;
@@ -1049,9 +1058,11 @@ extern "C" int tq_kv_dequantize_paged_trtllm_layered(
     int const packed_bytes_per_head  = d_head * bits / 8;
     int const packed_section_bytes   = n_kv_heads * tokens_per_block * packed_bytes_per_head;
     int const norms_section_bytes    = n_kv_heads * tokens_per_block * (int)sizeof(float);
-    int const slot_inner_bytes       = packed_section_bytes + norms_section_bytes;
-    int const per_block_bytes        = n_layers_per_pool * kv_factor * slot_inner_bytes;
-    int const layer_kv_offset_bytes  = (relative_layer * kv_factor + k_or_v) * slot_inner_bytes;
+    int const slot_inner_for_stride
+        = (slot_inner_bytes > 0) ? slot_inner_bytes : (packed_section_bytes + norms_section_bytes);
+    if (slot_inner_for_stride < packed_section_bytes + norms_section_bytes) return cudaErrorInvalidValue;
+    int const per_block_bytes        = n_layers_per_pool * kv_factor * slot_inner_for_stride;
+    int const layer_kv_offset_bytes  = (relative_layer * kv_factor + k_or_v) * slot_inner_for_stride;
 
     uint8_t const* layer_k_or_v_packed
         = static_cast<uint8_t const*>(pool_base) + layer_kv_offset_bytes;

@@ -71,17 +71,23 @@ int tq_kv_dequantize_paged(void const* d_packed_cache, float const* d_norms_cach
 // (relative_layer, k_or_v) selector; internally compute strides for
 // the inline-norms layout TurboquantKVCacheManager allocates.
 //
-// With n_layers_per_pool=1 and kv_factor=1 the strides reduce to the
-// inline-norms-single-layer layout (i.e. effectively
-// TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS for one layer).
+// `slot_inner_bytes`: actual per-(block, layer, K-or-V) byte stride
+// of the pool. Pass ≤ 0 to derive from packed_section + norms_section
+// (Option A shrunk layout, B.3b active). Pass `n_kv_heads *
+// tokens_per_block * d_head * sizeof(fp16)` to match an unshrunk
+// fp16 pool (B.3b not active). Must be ≥ packed + norms.
+//
+// With n_layers_per_pool=1, kv_factor=1, slot_inner_bytes≤0 the
+// strides reduce to the inline-norms-single-layer layout (i.e.
+// effectively TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS for one layer).
 int tq_kv_quantize_paged_trtllm_layered(void const* d_kv, int32_t const* d_slot_mapping, void* pool_base,
     int8_t const* d_signs, float const* d_centroids, float const* d_thresholds, int bits, int dtype, int n_tokens,
     int n_kv_heads, int d_head, int tokens_per_block, int n_layers_per_pool, int kv_factor, int relative_layer,
-    int k_or_v, void* stream);
+    int k_or_v, int slot_inner_bytes, void* stream);
 
 int tq_kv_dequantize_paged_trtllm_layered(void const* pool_base, int32_t const* d_physical_block_ids,
     int8_t const* d_signs, float const* d_centroids, void* d_scratch_out, int bits, int dtype, int n_scratch_blocks,
     int n_kv_heads, int d_head, int tokens_per_block, int n_layers_per_pool, int kv_factor, int relative_layer,
-    int k_or_v, void* stream);
+    int k_or_v, int slot_inner_bytes, void* stream);
 
 } // extern "C"

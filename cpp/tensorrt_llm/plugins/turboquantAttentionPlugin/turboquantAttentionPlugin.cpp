@@ -348,10 +348,12 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             // layered code path that the real-pool integration will use.
             int rc3 = tq_kv_quantize_paged_trtllm_layered(inputs[0], slotMapping, shadowPool, gQuantState.signs,
                 gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16, nTokens, nTotalHeads, kDHead,
-                kTokensPerBlock, /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0, /*k_or_v=*/0, stream);
+                kTokensPerBlock, /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0, /*k_or_v=*/0,
+                /*slot_inner_bytes=*/-1, stream);
             int rc6 = tq_kv_dequantize_paged_trtllm_layered(shadowPool, physBlocks, gQuantState.signs,
                 gQuantState.centroids, k6Scratch, mTurboquantBits, kDtypeFP16, nBlocks, nTotalHeads, kDHead,
-                kTokensPerBlock, /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0, /*k_or_v=*/0, stream);
+                kTokensPerBlock, /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0, /*k_or_v=*/0,
+                /*slot_inner_bytes=*/-1, stream);
             cudaError_t syncErr = cudaStreamSynchronize(stream);
             TLLM_LOG_INFO(
                 "[B.2.2] K3+K6 layered sanity (nLayers=1, kvFactor=1): rc3=%d rc6=%d cudaSync=%d "
@@ -371,24 +373,17 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         if (k6Scratch)
             cudaFree(k6Scratch);
 
-        // B.2.2 step 7 — REMOVED. The K3+K6 real-pool sanity ping
-        // corrupted the persistent pool because my layered launcher
-        // computed strides using slot_inner_bytes = packed + norms
-        // (33792 for Llama-3-8B bits=8), but the manager (B.3b not
-        // wired yet) allocates slot_inner = n_kv_heads * tokens_per_
-        // block * d_head * sizeof(fp16) = 65536. With the wrong
-        // stride, my V writes at slot 32 (block 1 in launcher view)
-        // landed inside block 0 layer 16's V region, corrupting it.
-        // Layer 16's subsequent enqueue then read garbage → FMHA
-        // produced garbage → generated text was all
-        // <|reserved_special_token_250|>.
-        //
-        // The fix is to pass slot_inner_bytes as a separate parameter
-        // to the layered launcher (B.3b unlocks the matched case
-        // where slot_inner_bytes = packed + norms). For now, drop the
-        // sanity ping — K3+K6 layered correctness is proven by the
-        // shadow-pool sanity above and the symbol check.
-        if (false)
+        // B.2.2 step 7 (re-enabled after slot_inner_bytes API fix) —
+        // K3 layered + K6 layered against the REAL persistent KV
+        // pool. Now passes slot_inner_bytes = n_kv_heads *
+        // tokens_per_block * d_head * sizeof(fp16) to match the
+        // manager's actual stride (no B.3b yet, pool is full fp16).
+        // The K3 write is still ephemeral (inner overwrites this
+        // slot's bytes during its own enqueue). Validates the full
+        // production-shape K3 + K6 invocation on the real pool.
+        if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)
+            && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)
+            && isEntryUsed(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS))
         {
             auto mappingIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING);
             auto poolPtrsIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
@@ -494,18 +489,29 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                     static_cast<std::uint8_t const*>(inputs[0]) + vSrcOffsetBytes, qkvStrideBytes, kvBytesPerToken,
                     nTokens, cudaMemcpyDeviceToDevice, stream);
 
+                // Manager (no B.3b) allocates slot_inner = n_kv_heads
+                // * tokens_per_block * d_head * sizeof(fp16) per
+                // (block, layer, K-or-V). Pass that as slot_inner_bytes
+                // so the layered launcher's stride math matches the
+                // actual pool layout.
+                int const slotInnerBytes = nKvHeadsLayer * kTokensPerBlock_b22 * dHeadLayer
+                    * static_cast<int>(sizeof(std::uint16_t));
                 int rcK = tq_kv_quantize_paged_trtllm_layered(dKContig, dSlotK, poolBase, gQuantState.signs,
                     gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16, nTokens, nKvHeadsLayer,
-                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/0, stream);
+                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/0,
+                    slotInnerBytes, stream);
                 int rcV = tq_kv_quantize_paged_trtllm_layered(dVContig, dSlotV, poolBase, gQuantState.signs,
                     gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16, nTokens, nKvHeadsLayer,
-                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/1, stream);
+                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/1,
+                    slotInnerBytes, stream);
                 int rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBase, dPhysBlocks, gQuantState.signs,
                     gQuantState.centroids, dK6ScratchK, mTurboquantBits, kDtypeFP16, nActiveBlocks, nKvHeadsLayer,
-                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/0, stream);
+                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/0,
+                    slotInnerBytes, stream);
                 int rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBase, dPhysBlocks, gQuantState.signs,
                     gQuantState.centroids, dK6ScratchV, mTurboquantBits, kDtypeFP16, nActiveBlocks, nKvHeadsLayer,
-                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/1, stream);
+                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/1,
+                    slotInnerBytes, stream);
                 cudaError_t syncErr2 = cudaStreamSynchronize(stream);
                 TLLM_LOG_INFO(
                     "[B.2.2] K3+K6 real-pool (layer=%d): rcK=%d rcV=%d rcK6=%d rcV6=%d cudaSync=%d "
