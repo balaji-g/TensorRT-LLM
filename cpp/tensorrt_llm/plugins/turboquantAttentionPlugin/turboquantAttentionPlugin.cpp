@@ -371,6 +371,104 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         if (k6Scratch)
             cudaFree(k6Scratch);
 
+        // B.2.2 step 7 — call K3 layered against the REAL persistent
+        // KV pool (HOST_KV_CACHE_POOL_POINTERS) for this layer's K
+        // slice of the new tokens. The K3 write is ephemeral: the
+        // inner GPTAttention's enqueue overwrites this slot's bytes
+        // with its fp16 K immediately after we forward. No K6 read,
+        // no pool-ptr patch yet — just validates the production-shape
+        // K3 invocation succeeds. K1+K2 streaming stays the active
+        // math hook so generation continues unchanged.
+        //
+        // Assumes Llama-3-style prefill of a single sequence at past
+        // length 0 (matches the smoke). General multi-seq + generation
+        // is the follow-up commit.
+        if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)
+            && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)
+            && isEntryUsed(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS))
+        {
+            auto mappingIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING);
+            auto poolPtrsIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
+            auto hBlockOffsetsIdx = getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS);
+            int32_t const* hMapping = static_cast<int32_t const*>(inputs[mappingIdx]);
+            int64_t const* hPoolPtrs = static_cast<int64_t const*>(inputs[poolPtrsIdx]);
+            int32_t const* hBlockOffsets = static_cast<int32_t const*>(inputs[hBlockOffsetsIdx]);
+            int nLayersPerPool = inputDesc[mappingIdx].dims.d[0];
+            int poolIdxForLayer = hMapping[this->mLayerIdx * 2 + 0];
+            int relativeLayer = hMapping[this->mLayerIdx * 2 + 1];
+            int nPools = inputDesc[poolPtrsIdx].dims.d[0];
+            int kvFactor = 2;
+            // pool_ptrs shape [n_pools, 2]; primary at index 0.
+            std::uintptr_t poolRaw
+                = static_cast<std::uintptr_t>(hPoolPtrs[poolIdxForLayer * 2 + 0]);
+            void* poolBase = reinterpret_cast<void*>(poolRaw);
+
+            int nKvHeadsLayer = this->mNumKVHeads; // Llama-3-8B: 8
+            int dHeadLayer = this->mHeadSize;       // 128
+            int nQHeads = this->mNumHeads;          // 32
+
+            // Compute slot mapping for K from host block_offsets.
+            // Layout [batch, beam, kvFactor=2, max_blocks_per_seq];
+            // K is k_or_v=0.
+            auto const& boDesc = inputDesc[hBlockOffsetsIdx];
+            int batchSize = boDesc.dims.d[0];
+            int beamWidth = boDesc.dims.d[1];
+            int maxBlocksPerSeq = boDesc.dims.d[3];
+            (void)batchSize;
+            (void)beamWidth;
+            constexpr int kTokensPerBlock_b22 = 32;
+            std::vector<int32_t> hSlotK(nTokens);
+            for (int t = 0; t < nTokens; ++t)
+            {
+                int blockInSeq = t / kTokensPerBlock_b22;
+                int offInBlock = t - blockInSeq * kTokensPerBlock_b22;
+                // [0, 0, 0, blockInSeq] index, k_or_v=0:
+                int physBlock
+                    = hBlockOffsets[((0 * beamWidth + 0) * kvFactor + 0) * maxBlocksPerSeq + blockInSeq];
+                hSlotK[t] = physBlock * kTokensPerBlock_b22 + offInBlock;
+            }
+
+            int32_t* dSlotK = nullptr;
+            void* dKContig = nullptr;
+            std::size_t const kContigBytes
+                = static_cast<std::size_t>(nTokens) * nKvHeadsLayer * dHeadLayer * sizeof(std::uint16_t);
+            bool realOk = (cudaMalloc(&dSlotK, nTokens * sizeof(int32_t)) == cudaSuccess);
+            realOk = realOk && (cudaMalloc(&dKContig, kContigBytes) == cudaSuccess);
+            if (realOk)
+            {
+                cudaMemcpyAsync(dSlotK, hSlotK.data(), nTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+                // Slice K out of fused QKV [nTokens, (nQ + 2*nKv)*dHead].
+                std::size_t const qkvStrideBytes
+                    = static_cast<std::size_t>(nQHeads + 2 * nKvHeadsLayer) * dHeadLayer * sizeof(std::uint16_t);
+                std::size_t const kSrcOffsetBytes
+                    = static_cast<std::size_t>(nQHeads) * dHeadLayer * sizeof(std::uint16_t);
+                std::size_t const kBytesPerToken
+                    = static_cast<std::size_t>(nKvHeadsLayer) * dHeadLayer * sizeof(std::uint16_t);
+                cudaError_t cpyErr = cudaMemcpy2DAsync(dKContig, kBytesPerToken,
+                    static_cast<std::uint8_t const*>(inputs[0]) + kSrcOffsetBytes, qkvStrideBytes, kBytesPerToken,
+                    nTokens, cudaMemcpyDeviceToDevice, stream);
+                int rcK = tq_kv_quantize_paged_trtllm_layered(dKContig, dSlotK, poolBase, gQuantState.signs,
+                    gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16, nTokens, nKvHeadsLayer,
+                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/0, stream);
+                cudaError_t syncErr2 = cudaStreamSynchronize(stream);
+                TLLM_LOG_INFO(
+                    "[B.2.2] K3 real-pool (layer=%d): pool_idx=%d rel_layer=%d n_layers_in_pool=%d "
+                    "n_pools=%d kv_factor=%d pool_base=%p slot[0]=%d slot[last]=%d cpyErr=%d rcK=%d "
+                    "cudaSync=%d",
+                    this->mLayerIdx, poolIdxForLayer, relativeLayer, nLayersPerPool, nPools, kvFactor, poolBase,
+                    hSlotK.empty() ? -1 : hSlotK.front(), hSlotK.empty() ? -1 : hSlotK.back(),
+                    static_cast<int>(cpyErr), rcK, static_cast<int>(syncErr2));
+            }
+            else
+            {
+                TLLM_LOG_ERROR("[B.2.2] K3 real-pool: cudaMalloc failed");
+            }
+            if (dSlotK)
+                cudaFree(dSlotK);
+            if (dKContig)
+                cudaFree(dKContig);
+        }
+
         // B.2.2 reconnaissance — log the input tensor descriptors we'll
         // need for K3/K6 paged write/read. Fires once globally; cheap.
         auto logTensor = [&](char const* label, IdxEntry e) {
