@@ -70,6 +70,10 @@ int tq_kv_dequantize_paged(void const* d_packed_cache, float const* d_norms_cach
 // [nBlocks, nLayers, kvFactor=2, slotInner] cache and the
 // (relative_layer, k_or_v) selector; internally compute strides for
 // the inline-norms layout TurboquantKVCacheManager allocates.
+//
+// With n_layers_per_pool=1 and kv_factor=1 the strides reduce to the
+// inline-norms-single-layer layout (i.e. effectively
+// TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS for one layer).
 int tq_kv_quantize_paged_trtllm_layered(void const* d_kv, int32_t const* d_slot_mapping, void* pool_base,
     int8_t const* d_signs, float const* d_centroids, float const* d_thresholds, int bits, int dtype, int n_tokens,
     int n_kv_heads, int d_head, int tokens_per_block, int n_layers_per_pool, int kv_factor, int relative_layer,

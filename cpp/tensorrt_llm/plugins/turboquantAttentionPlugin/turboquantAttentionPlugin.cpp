@@ -341,20 +341,21 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 hPhys[i] = i;
             cudaMemcpyAsync(physBlocks, hPhys.data(), nBlocks * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
 
-            // K3 inline-norms layout: packed = pool_base, norms = pool_base + packed_section.
-            constexpr int kLayoutInlineNorms = 2; // TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS
-            int rc3 = tq_kv_quantize_paged(inputs[0], slotMapping, shadowPool,
-                reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(shadowPool) + packedSectionBytes),
-                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
-                kLayoutInlineNorms, nTokens, nTotalHeads, kDHead, nBlocks, kTokensPerBlock, stream);
-            int rc6 = tq_kv_dequantize_paged(shadowPool,
-                reinterpret_cast<float const*>(reinterpret_cast<uint8_t*>(shadowPool) + packedSectionBytes), physBlocks,
-                gQuantState.signs, gQuantState.centroids, k6Scratch, mTurboquantBits, kDtypeFP16, kLayoutInlineNorms,
-                nBlocks, nTotalHeads, kDHead, kTokensPerBlock, stream);
+            // Layered launcher with n_layers_per_pool=1, kv_factor=1
+            // degenerates to single-layer inline-norms. Strides match
+            // what TQ_LAYOUT_VLLM_BLOCKED_INLINE_NORMS produces, so this
+            // is equivalent to the prior sanity ping but exercises the
+            // layered code path that the real-pool integration will use.
+            int rc3 = tq_kv_quantize_paged_trtllm_layered(inputs[0], slotMapping, shadowPool, gQuantState.signs,
+                gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16, nTokens, nTotalHeads, kDHead,
+                kTokensPerBlock, /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0, /*k_or_v=*/0, stream);
+            int rc6 = tq_kv_dequantize_paged_trtllm_layered(shadowPool, physBlocks, gQuantState.signs,
+                gQuantState.centroids, k6Scratch, mTurboquantBits, kDtypeFP16, nBlocks, nTotalHeads, kDHead,
+                kTokensPerBlock, /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0, /*k_or_v=*/0, stream);
             cudaError_t syncErr = cudaStreamSynchronize(stream);
             TLLM_LOG_INFO(
-                "[B.2.2] K3+K6 inline-norms sanity: rc3=%d rc6=%d cudaSync=%d (nBlocks=%d, "
-                "poolBytes=%zu, k6Scratch=%zu)",
+                "[B.2.2] K3+K6 layered sanity (nLayers=1, kvFactor=1): rc3=%d rc6=%d cudaSync=%d "
+                "(nBlocks=%d, poolBytes=%zu, k6Scratch=%zu)",
                 rc3, rc6, static_cast<int>(syncErr), nBlocks, poolBytes, k6ScratchBytes);
         }
         else
