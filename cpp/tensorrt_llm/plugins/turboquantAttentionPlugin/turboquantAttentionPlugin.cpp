@@ -386,34 +386,80 @@ nvinfer1::PluginFieldCollection const* TurboquantAttentionPluginCreator::getFiel
 nvinfer1::IPluginV2* TurboquantAttentionPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
 {
-    auto* parent = static_cast<GPTAttentionPlugin*>(GPTAttentionPluginCreator::createPlugin(name, fc));
-    if (parent == nullptr)
+    // Parse PluginField directly (same field set as GPTAttentionPluginCreator
+    // plus our turboquant_bits). The earlier delegate-and-deserialize
+    // approach segfaulted on getWorkspaceSize because the
+    // serialize→destroy→deserialize round-trip didn't fully restore
+    // GPTAttentionPluginCommon's internal state (M12.4 B.2.1b
+    // diagnosis 2026-06-03).
+    PluginFieldParser p{fc->nbFields, fc->fields};
+    try
     {
-        return nullptr;
+        int turboquantBits = p.getScalar<int32_t>("turboquant_bits").value();
+        validateBits(turboquantBits);
+        auto* obj = new TurboquantAttentionPlugin(p.getScalar<int32_t>("layer_idx").value(),
+            p.getScalar<int32_t>("num_heads").value(), p.getScalar<int32_t>("vision_start").value(),
+            p.getScalar<int32_t>("vision_length").value(), p.getScalar<int32_t>("num_kv_heads").value(),
+            p.getScalar<int32_t>("num_kv_heads_origin").value(), p.getScalar<int32_t>("head_size").value(),
+            p.getScalar<int32_t>("unidirectional").value(), p.getScalar<float>("q_scaling").value(),
+            p.getScalar<float>("attn_logit_softcapping_scale").value(),
+            static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(
+                p.getScalar<int8_t>("position_embedding_type").value()),
+            p.getScalar<int32_t>("rotary_embedding_dim").value(), p.getScalar<float>("rotary_embedding_base").value(),
+            static_cast<tensorrt_llm::kernels::RotaryScalingType>(
+                p.getScalar<int8_t>("rotary_embedding_scale_type").value()),
+            p.getScalar<float>("rotary_embedding_scale").value(),
+            p.getScalar<float>("rotary_embedding_short_m_scale").value(),
+            p.getScalar<float>("rotary_embedding_long_m_scale").value(),
+            p.getScalar<int32_t>("rotary_embedding_max_positions").value(),
+            p.getScalar<int32_t>("rotary_embedding_original_max_positions").value(),
+            static_cast<int32_t>(p.getScalar<int32_t>("tp_size").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("tp_rank").value()),
+            static_cast<bool>(p.getScalar<int8_t>("unfuse_qkv_gemm").value()),
+            static_cast<bool>(p.getScalar<int8_t>("use_logn_scaling").value()),
+            static_cast<tensorrt_llm::kernels::ContextFMHAType>(p.getScalar<int8_t>("context_fmha_type").value()),
+            p.getScalar<int32_t>("kv_cache_quant_mode").value(),
+            static_cast<bool>(p.getScalar<int8_t>("remove_input_padding").value()),
+            static_cast<tensorrt_llm::kernels::AttentionMaskType>(p.getScalar<int32_t>("mask_type").value()),
+            tensorrt_llm::kernels::BlockSparseParams{p.getScalar<int32_t>("block_sparse_block_size").value(),
+                static_cast<bool>(p.getScalar<int8_t>("block_sparse_homo_head_pattern").value()),
+                p.getScalar<int32_t>("block_sparse_num_local_blocks").value(),
+                p.getScalar<int32_t>("block_sparse_vertical_stride").value()},
+            static_cast<bool>(p.getScalar<int32_t>("paged_kv_cache").value()),
+            p.getScalar<int32_t>("tokens_per_block").value(),
+            static_cast<nvinfer1::DataType>(p.getScalar<int32_t>("type_id").value()),
+            p.getScalar<int32_t>("max_context_length").value(),
+            static_cast<bool>(p.getScalar<int8_t>("qkv_bias_enabled").value()),
+            static_cast<bool>(p.getScalar<int8_t>("do_cross_attention").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("max_distance").value()),
+            static_cast<bool>(p.getScalar<int8_t>("pos_shift_enabled").value()),
+            static_cast<bool>(p.getScalar<int8_t>("dense_context_fmha").value()),
+            static_cast<bool>(p.getScalar<int8_t>("use_paged_context_fmha").value()),
+            static_cast<bool>(p.getScalar<int8_t>("use_fp8_context_fmha").value()),
+            static_cast<bool>(p.getScalar<int8_t>("has_full_attention_mask").value()),
+            static_cast<bool>(p.getScalar<int32_t>("use_cache").value()),
+            static_cast<bool>(p.getScalar<int8_t>("is_spec_decoding_enabled").value()),
+            static_cast<bool>(p.getScalar<int8_t>("spec_decoding_is_generation_length_variable").value()),
+            p.getScalar<int32_t>("spec_decoding_max_generation_length").value(),
+            static_cast<int8_t>(p.getScalar<int8_t>("is_mla_enabled").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("q_lora_rank").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("kv_lora_rank").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("qk_nope_head_dim").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("qk_rope_head_dim").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("v_head_dim").value()),
+            static_cast<bool>(p.getScalar<int8_t>("fuse_fp4_quant").value()),
+            static_cast<bool>(p.getScalar<int8_t>("skip_attn").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("cp_size").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("cp_rank").value()),
+            static_cast<std::set<int32_t>>(p.getSet<int32_t>("cp_group").value()), turboquantBits);
+        obj->setPluginNamespace(getPluginNamespace());
+        return obj;
     }
-
-    int turboquantBits = 8;
-    for (int i = 0; i < fc->nbFields; ++i)
+    catch (std::exception const& e)
     {
-        auto const& f = fc->fields[i];
-        if (f.name != nullptr && std::strcmp(f.name, "turboquant_bits") == 0
-            && f.type == nvinfer1::PluginFieldType::kINT32 && f.data != nullptr)
-        {
-            turboquantBits = *static_cast<int32_t const*>(f.data);
-            break;
-        }
+        caughtError(e);
     }
-    validateBits(turboquantBits);
-
-    auto const parentSize = parent->getSerializationSize();
-    std::vector<char> buf(parentSize + sizeof(int));
-    parent->serialize(buf.data());
-    std::memcpy(buf.data() + parentSize, &turboquantBits, sizeof(int));
-    parent->destroy();
-
-    auto* obj = new TurboquantAttentionPlugin(buf.data(), buf.size());
-    obj->setPluginNamespace(getPluginNamespace());
-    return obj;
+    return nullptr;
 }
 
 nvinfer1::IPluginV2* TurboquantAttentionPluginCreator::deserializePlugin(
