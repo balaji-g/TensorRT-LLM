@@ -583,12 +583,18 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     }
     patchedInputs[0] = mWorkspace.kv_out;
 
-    // B.2.2 step 9a — pool-pointer patch with stable host buffer.
-    // Temporarily disabled — the supposedly-no-op copy broke
-    // generation in commits b17e2c993 (stack buffer) and 9e5d63817
-    // (member buffer). Need to diagnose what's actually different
-    // between the patched and original buffers; the values copied
-    // should be identical. Without the patch, generation passes.
+    // B.2.2 step 9a (re-enabled) — pool-pointer no-op patch.
+    // The earlier failure was masked by the K3+K6 stride bug; with
+    // slot_inner_bytes plumbed through (commit 85f353bf2), strides
+    // are correct and the no-op patch should now also be a true
+    // no-op. Per-enqueue copy of HOST_KV_CACHE_POOL_POINTERS' int64
+    // values into a heap-stable plugin-member buffer mPatchedPoolPtrs,
+    // then set patchedInputs[poolPtrsIdx] to the member buffer.
+    // Identical pointer values → identical behaviour.
+    //
+    // Once verified, step 9b replaces mPatchedPoolPtrs[0] with a
+    // device pointer to a K6-dequant scratch buffer so the inner
+    // gpt_attention reads decompressed K/V history from scratch.
     static std::atomic<bool> sPatchDiagLogged{false};
     if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS))
     {
@@ -599,13 +605,17 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         {
             totalElems *= d.dims.d[i];
         }
+        if (totalElems > 0 && totalElems <= static_cast<int>(sizeof(mPatchedPoolPtrs) / sizeof(std::int64_t)))
+        {
+            std::memcpy(mPatchedPoolPtrs, inputs[poolPtrsIdx], totalElems * sizeof(std::int64_t));
+            patchedInputs[poolPtrsIdx] = mPatchedPoolPtrs;
+        }
         bool expected = false;
-        if (sPatchDiagLogged.compare_exchange_strong(expected, true) && totalElems > 0
-            && totalElems <= static_cast<int>(sizeof(mPatchedPoolPtrs) / sizeof(std::int64_t)))
+        if (sPatchDiagLogged.compare_exchange_strong(expected, true) && totalElems > 0)
         {
             std::int64_t const* orig = static_cast<std::int64_t const*>(inputs[poolPtrsIdx]);
-            std::memcpy(mPatchedPoolPtrs, inputs[poolPtrsIdx], totalElems * sizeof(std::int64_t));
-            TLLM_LOG_INFO("[B.2.2] pool-ptr diag layer=%d totalElems=%d orig=[0x%lx 0x%lx ...] copy=[0x%lx 0x%lx ...]",
+            TLLM_LOG_INFO("[B.2.2] pool-ptr no-op patch layer=%d totalElems=%d orig=[0x%lx 0x%lx ...] "
+                          "copy=[0x%lx 0x%lx ...]",
                 this->mLayerIdx, totalElems, totalElems > 0 ? orig[0] : 0, totalElems > 1 ? orig[1] : 0,
                 mPatchedPoolPtrs[0], mPatchedPoolPtrs[1]);
         }
