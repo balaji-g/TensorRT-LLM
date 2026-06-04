@@ -713,6 +713,7 @@ cudaError_t launch_paged_quantize(
 
 #undef TQ_LAUNCH_PAGED_QUANTIZE
 
+
 // =====================================================================
 // K6 — paged read (gather + dequantize blocks → fp16/bf16 scratch).
 //
@@ -921,6 +922,188 @@ cudaError_t launch_paged_dequantize(
 }
 
 #undef TQ_LAUNCH_PAGED_DEQUANT
+
+// ---------------------------------------------------------------------
+// K3 / K6 — TRT-LLM layered-pool variant.
+// TRT-LLM allocates KV cache as a 4-D tensor:
+//   pool[nBlocks, nLayers, kvFactor=2, slotInnerBytes]
+// where one (block, layer, K-or-V) slot holds n_kv_heads * tokens_per_
+// block * packed_bytes_per_head bytes of packed indices followed by
+// n_kv_heads * tokens_per_block * sizeof(float) bytes of norms
+// (Option A inline layout matching TurboquantKVCacheManager B.1.1).
+//
+// Caller passes the POOL BASE; this launcher computes the per-(layer,
+// K-or-V) offset and the full per-block stride (nLayers * kvFactor *
+// slotInnerBytes) so block N's slot for layer L's K-or-V is at the
+// right address.
+// ---------------------------------------------------------------------
+
+extern "C" int tq_kv_quantize_paged_trtllm_layered(
+    void const*    d_kv,             // [n_tokens, n_kv_heads, d_head]
+    int32_t const* d_slot_mapping,   // [n_tokens]
+    void*          pool_base,        // uint8* pool buffer
+    int8_t const*  d_signs,
+    float const*   d_centroids,
+    float const*   d_thresholds,
+    int            bits,
+    int            dtype,
+    int            n_tokens,
+    int            n_kv_heads,
+    int            d_head,
+    int            tokens_per_block,
+    int            n_layers_per_pool,
+    int            kv_factor,        // 2
+    int            relative_layer,   // 0..n_layers_per_pool-1
+    int            k_or_v,           // 0 for K, 1 for V
+    void*          stream_v
+) {
+    if ((d_head & (d_head - 1)) != 0 || d_head <= 0 || d_head > 1024) return cudaErrorInvalidValue;
+    if (dtype != TQ_DTYPE_FP16 && dtype != TQ_DTYPE_BF16) return cudaErrorInvalidValue;
+    if (bits != 4 && bits != 8) return cudaErrorInvalidValue;
+    if (n_tokens <= 0 || n_kv_heads <= 0 || tokens_per_block <= 0) return cudaErrorInvalidValue;
+    if (n_layers_per_pool <= 0 || kv_factor <= 0) return cudaErrorInvalidValue;
+    if (relative_layer < 0 || relative_layer >= n_layers_per_pool) return cudaErrorInvalidValue;
+    if (k_or_v != 0 && k_or_v != 1) return cudaErrorInvalidValue;
+
+    int const packed_bytes_per_head  = d_head * bits / 8;
+    int const packed_section_bytes   = n_kv_heads * tokens_per_block * packed_bytes_per_head;
+    int const norms_section_bytes    = n_kv_heads * tokens_per_block * (int)sizeof(float);
+    int const slot_inner_bytes       = packed_section_bytes + norms_section_bytes;
+    int const per_block_bytes        = n_layers_per_pool * kv_factor * slot_inner_bytes;
+    int const layer_kv_offset_bytes  = (relative_layer * kv_factor + k_or_v) * slot_inner_bytes;
+
+    uint8_t* layer_k_or_v_packed = static_cast<uint8_t*>(pool_base) + layer_kv_offset_bytes;
+    float*   layer_k_or_v_norms  = reinterpret_cast<float*>(layer_k_or_v_packed + packed_section_bytes);
+
+    int const packed_block_stride = per_block_bytes;
+    int const packed_head_stride  = tokens_per_block * packed_bytes_per_head;
+    int const packed_slot_stride  = packed_bytes_per_head;
+    int const norms_block_stride  = per_block_bytes / (int)sizeof(float);
+    int const norms_head_stride   = tokens_per_block;
+    int const norms_slot_stride   = 1;
+
+    int threads = 64;
+    if (d_head >= 128) threads = 128;
+    if (d_head >= 256) threads = 256;
+
+    dim3 grid(n_tokens, n_kv_heads);
+    size_t smem = (d_head + threads) * sizeof(float);
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_v);
+
+    if (dtype == TQ_DTYPE_FP16)
+    {
+        if (bits == 8)
+            paged_quantize_per_head_kernel<8, __half><<<grid, threads, smem, stream>>>(
+                static_cast<__half const*>(d_kv), d_slot_mapping, d_signs, d_centroids, d_thresholds,
+                layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_head_stride, packed_slot_stride,
+                norms_block_stride, norms_head_stride, norms_slot_stride);
+        else // bits == 4
+            paged_quantize_per_head_kernel<4, __half><<<grid, threads, smem, stream>>>(
+                static_cast<__half const*>(d_kv), d_slot_mapping, d_signs, d_centroids, d_thresholds,
+                layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_head_stride, packed_slot_stride,
+                norms_block_stride, norms_head_stride, norms_slot_stride);
+    }
+    else // BF16
+    {
+        if (bits == 8)
+            paged_quantize_per_head_kernel<8, __nv_bfloat16><<<grid, threads, smem, stream>>>(
+                static_cast<__nv_bfloat16 const*>(d_kv), d_slot_mapping, d_signs, d_centroids, d_thresholds,
+                layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_head_stride, packed_slot_stride,
+                norms_block_stride, norms_head_stride, norms_slot_stride);
+        else
+            paged_quantize_per_head_kernel<4, __nv_bfloat16><<<grid, threads, smem, stream>>>(
+                static_cast<__nv_bfloat16 const*>(d_kv), d_slot_mapping, d_signs, d_centroids, d_thresholds,
+                layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_head_stride, packed_slot_stride,
+                norms_block_stride, norms_head_stride, norms_slot_stride);
+    }
+    return (int)cudaGetLastError();
+}
+
+extern "C" int tq_kv_dequantize_paged_trtllm_layered(
+    void const*    pool_base,
+    int32_t const* d_physical_block_ids,
+    int8_t const*  d_signs,
+    float const*   d_centroids,
+    void*          d_scratch_out,    // [n_scratch_blocks, n_kv_heads, tokens_per_block, d_head]
+    int            bits,
+    int            dtype,
+    int            n_scratch_blocks,
+    int            n_kv_heads,
+    int            d_head,
+    int            tokens_per_block,
+    int            n_layers_per_pool,
+    int            kv_factor,
+    int            relative_layer,
+    int            k_or_v,
+    void*          stream_v
+) {
+    if ((d_head & (d_head - 1)) != 0 || d_head <= 0 || d_head > 1024) return cudaErrorInvalidValue;
+    if (dtype != TQ_DTYPE_FP16 && dtype != TQ_DTYPE_BF16) return cudaErrorInvalidValue;
+    if (bits != 4 && bits != 8) return cudaErrorInvalidValue;
+    if (n_scratch_blocks <= 0 || n_kv_heads <= 0 || tokens_per_block <= 0) return cudaErrorInvalidValue;
+
+    int const packed_bytes_per_head  = d_head * bits / 8;
+    int const packed_section_bytes   = n_kv_heads * tokens_per_block * packed_bytes_per_head;
+    int const norms_section_bytes    = n_kv_heads * tokens_per_block * (int)sizeof(float);
+    int const slot_inner_bytes       = packed_section_bytes + norms_section_bytes;
+    int const per_block_bytes        = n_layers_per_pool * kv_factor * slot_inner_bytes;
+    int const layer_kv_offset_bytes  = (relative_layer * kv_factor + k_or_v) * slot_inner_bytes;
+
+    uint8_t const* layer_k_or_v_packed
+        = static_cast<uint8_t const*>(pool_base) + layer_kv_offset_bytes;
+    float const* layer_k_or_v_norms
+        = reinterpret_cast<float const*>(layer_k_or_v_packed + packed_section_bytes);
+
+    int const packed_block_stride   = per_block_bytes;
+    int const packed_kv_head_stride = tokens_per_block * packed_bytes_per_head;
+    int const packed_slot_stride    = packed_bytes_per_head;
+    int const norms_block_stride    = per_block_bytes / (int)sizeof(float);
+    int const norms_kv_head_stride  = tokens_per_block;
+    int const norms_slot_stride     = 1;
+
+    int threads = 64;
+    if (d_head >= 128) threads = 128;
+    if (d_head >= 256) threads = 256;
+    dim3 grid(n_scratch_blocks * tokens_per_block, n_kv_heads);
+    size_t smem = (size_t)d_head * sizeof(float);
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_v);
+
+    if (dtype == TQ_DTYPE_FP16)
+    {
+        if (bits == 8)
+            paged_dequantize_per_token_kernel<8, __half><<<grid, threads, smem, stream>>>(
+                layer_k_or_v_packed, layer_k_or_v_norms, d_physical_block_ids, d_signs, d_centroids,
+                static_cast<__half*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_kv_head_stride, packed_slot_stride,
+                norms_block_stride, norms_kv_head_stride, norms_slot_stride);
+        else
+            paged_dequantize_per_token_kernel<4, __half><<<grid, threads, smem, stream>>>(
+                layer_k_or_v_packed, layer_k_or_v_norms, d_physical_block_ids, d_signs, d_centroids,
+                static_cast<__half*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_kv_head_stride, packed_slot_stride,
+                norms_block_stride, norms_kv_head_stride, norms_slot_stride);
+    }
+    else
+    {
+        if (bits == 8)
+            paged_dequantize_per_token_kernel<8, __nv_bfloat16><<<grid, threads, smem, stream>>>(
+                layer_k_or_v_packed, layer_k_or_v_norms, d_physical_block_ids, d_signs, d_centroids,
+                static_cast<__nv_bfloat16*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_kv_head_stride, packed_slot_stride,
+                norms_block_stride, norms_kv_head_stride, norms_slot_stride);
+        else
+            paged_dequantize_per_token_kernel<4, __nv_bfloat16><<<grid, threads, smem, stream>>>(
+                layer_k_or_v_packed, layer_k_or_v_norms, d_physical_block_ids, d_signs, d_centroids,
+                static_cast<__nv_bfloat16*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_kv_head_stride, packed_slot_stride,
+                norms_block_stride, norms_kv_head_stride, norms_slot_stride);
+    }
+    return (int)cudaGetLastError();
+}
 
 // =====================================================================
 // K5 — paged attention decode (docs/KERNELS.md §3.4.3).

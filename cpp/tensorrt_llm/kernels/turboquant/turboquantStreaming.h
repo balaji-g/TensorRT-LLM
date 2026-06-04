@@ -66,4 +66,18 @@ int tq_kv_dequantize_paged(void const* d_packed_cache, float const* d_norms_cach
     int8_t const* d_signs, float const* d_centroids, void* d_scratch_out, int bits, int dtype, int layout,
     int n_scratch_blocks, int n_kv_heads, int d_head, int block_size, void* stream);
 
+// K3 / K6 — TRT-LLM layered-pool variants. Take pool_base for a
+// [nBlocks, nLayers, kvFactor=2, slotInner] cache and the
+// (relative_layer, k_or_v) selector; internally compute strides for
+// the inline-norms layout TurboquantKVCacheManager allocates.
+int tq_kv_quantize_paged_trtllm_layered(void const* d_kv, int32_t const* d_slot_mapping, void* pool_base,
+    int8_t const* d_signs, float const* d_centroids, float const* d_thresholds, int bits, int dtype, int n_tokens,
+    int n_kv_heads, int d_head, int tokens_per_block, int n_layers_per_pool, int kv_factor, int relative_layer,
+    int k_or_v, void* stream);
+
+int tq_kv_dequantize_paged_trtllm_layered(void const* pool_base, int32_t const* d_physical_block_ids,
+    int8_t const* d_signs, float const* d_centroids, void* d_scratch_out, int bits, int dtype, int n_scratch_blocks,
+    int n_kv_heads, int d_head, int tokens_per_block, int n_layers_per_pool, int kv_factor, int relative_layer,
+    int k_or_v, void* stream);
+
 } // extern "C"
