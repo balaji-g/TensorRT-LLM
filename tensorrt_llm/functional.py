@@ -5511,15 +5511,6 @@ def gpt_attention(
     _turboquant_attn_plugin = default_net(
     ).plugin_config.turboquant_attention_plugin
     _turboquant_bits = default_net().plugin_config.turboquant_bits
-    # Loud diagnostic during M12.4 B.3a end-to-end bring-up — prints
-    # on every gpt_attention layer call at engine-build time. Easy to
-    # grep ("[TQ-ROUTE]") in stderr to confirm the branch is reached
-    # and to see what value the field actually has.
-    print(
-        f"[TQ-ROUTE] gpt_attention layer build: "
-        f"turboquant_attention_plugin={_turboquant_attn_plugin!r}, "
-        f"turboquant_bits={_turboquant_bits!r}",
-        flush=True)
     if _turboquant_attn_plugin:
         assert _turboquant_bits in (4, 8), (
             f"turboquant_attention_plugin requires turboquant_bits ∈ {{4, 8}}, "
@@ -5530,13 +5521,10 @@ def gpt_attention(
             "TurboquantAttention plugin not registered. "
             "Build the fork from balaji-g/TensorRT-LLM:turboquant-integration "
             "and ensure libnvinfer_plugin_tensorrt_llm.so contains the new plugin.")
-        print(f"[TQ-ROUTE] -> picked TurboquantAttention creator", flush=True)
     else:
         attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'GPTAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
         assert attn_plg_creator is not None
-        print(f"[TQ-ROUTE] -> picked GPTAttention creator (turboquant flag empty)",
-              flush=True)
     assert host_context_lengths is not None or not default_net(
     ).plugin_config.remove_input_padding
     assert isinstance(max_context_length, int)
