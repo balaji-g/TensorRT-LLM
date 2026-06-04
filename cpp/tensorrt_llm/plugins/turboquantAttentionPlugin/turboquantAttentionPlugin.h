@@ -19,6 +19,7 @@
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace tensorrt_llm::plugins
 {
@@ -111,6 +112,11 @@ public:
 private:
     int mTurboquantBits;
     TurboquantEnqueueWorkspace mWorkspace{};
+    // Heap-stable host buffer for the HOST_KV_CACHE_POOL_POINTERS patch.
+    // TRT-LLM's gpt_attention reads this input lazily (after our enqueue
+    // returns), so a stack-local buffer races with the read. Lives as
+    // long as the plugin instance.
+    std::int64_t mPatchedPoolPtrs[16] = {0};
 };
 
 class TurboquantAttentionPluginCreator : public GPTAttentionPluginCreator

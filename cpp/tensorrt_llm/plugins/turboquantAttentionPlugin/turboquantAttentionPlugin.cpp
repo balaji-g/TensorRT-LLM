@@ -574,18 +574,13 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     }
     patchedInputs[0] = mWorkspace.kv_out;
 
-    // B.2.2 step 9a — pool-pointer patch dry run. Copies
-    // HOST_KV_CACHE_POOL_POINTERS into a stack-local host buffer with
-    // identical values and patches the inputs array to point at the
-    // copy. Generation must continue byte-for-byte unchanged since the
-    // pointer values are the same; this just validates the patch
-    // machinery so the next session can replace the copy with a
-    // scratch ptr that holds K6-dequantized data.
-    //
-    // Pool pointers tensor shape [n_pools, 2] of int64; n_pools is
-    // typically 1 for Llama-3. Bounded array size accommodates up to
-    // 8 pools.
-    std::int64_t hPoolPtrsCopy[16] = {0};
+    // B.2.2 step 9a — pool-pointer patch with stable host buffer.
+    // Initial attempt (b17e2c993) used a stack-local copy and broke
+    // generation — TRT-LLM's gpt_attention reads HOST_KV_CACHE_POOL_
+    // POINTERS asynchronously (after our enqueue returns), so the
+    // stack frame was gone by the time the dereference happened.
+    // Fix: copy into a plugin-member buffer (mPatchedPoolPtrs) that
+    // lives as long as this plugin instance.
     if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS))
     {
         auto poolPtrsIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
@@ -595,10 +590,10 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         {
             totalElems *= d.dims.d[i];
         }
-        if (totalElems > 0 && totalElems <= static_cast<int>(sizeof(hPoolPtrsCopy) / sizeof(std::int64_t)))
+        if (totalElems > 0 && totalElems <= static_cast<int>(sizeof(mPatchedPoolPtrs) / sizeof(std::int64_t)))
         {
-            std::memcpy(hPoolPtrsCopy, inputs[poolPtrsIdx], totalElems * sizeof(std::int64_t));
-            patchedInputs[poolPtrsIdx] = hPoolPtrsCopy;
+            std::memcpy(mPatchedPoolPtrs, inputs[poolPtrsIdx], totalElems * sizeof(std::int64_t));
+            patchedInputs[poolPtrsIdx] = mPatchedPoolPtrs;
         }
     }
     return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, patchedInputs, outputs, workspace, stream);
