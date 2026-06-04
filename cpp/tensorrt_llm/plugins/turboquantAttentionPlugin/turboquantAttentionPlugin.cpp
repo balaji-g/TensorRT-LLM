@@ -320,11 +320,23 @@ char const* TurboquantAttentionPlugin::getPluginVersion() const noexcept
 
 TurboquantAttentionPlugin* TurboquantAttentionPlugin::clone() const noexcept
 {
+    // The parent's clone() uses cloneImpl<T>() which calls T's copy
+    // constructor and then plugin->initialize(). Without initialize(),
+    // GPTAttentionPluginCommon's runtime state stays uninitialized and
+    // getWorkspaceSize segfaults (verified 2026-06-03 backtrace into
+    // AttentionOp::getWorkspaceSizeForContext).
+    //
+    // We can't use the compiler-default copy ctor blindly because our
+    // mWorkspace owns GPU buffers; the clone must start with an empty
+    // workspace (lazy-allocated on first enqueue). Round-trip through
+    // serialize/deserialize (which gives a fresh mWorkspace) and then
+    // explicitly call initialize() to match the parent's invariant.
     auto const size = getSerializationSize();
     std::vector<char> buffer(size);
     serialize(buffer.data());
     auto* cloned = new TurboquantAttentionPlugin(buffer.data(), size);
     cloned->setPluginNamespace(getPluginNamespace());
+    cloned->initialize();
     return cloned;
 }
 
