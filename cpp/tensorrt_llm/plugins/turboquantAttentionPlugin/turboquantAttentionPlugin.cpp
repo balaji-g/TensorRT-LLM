@@ -793,30 +793,40 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             void* const poolBaseShifted
                 = static_cast<std::uint8_t*>(poolBase) + layerStrideBytes;
 
-            // K3 K and V into the real persistent pool, addressed flat.
-            int rcK = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK, poolBaseShifted,
-                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
-                nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22,
-                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-                /*k_or_v=*/0, slotInnerBytes, stream);
-            int rcV = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV, poolBaseShifted,
-                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
-                nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22,
-                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-                /*k_or_v=*/0, slotInnerBytes, stream);
-
-            // K6 dequant active K and V slots from the real pool into
-            // contiguous scratch_k6 buffers — also flat.
-            int rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksK,
-                gQuantState.signs, gQuantState.centroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
-                static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
-                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-                /*k_or_v=*/0, slotInnerBytes, stream);
-            int rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksV,
-                gQuantState.signs, gQuantState.centroids, mScratchK6V, mTurboquantBits, kDtypeFP16,
-                static_cast<int>(vBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
-                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-                /*k_or_v=*/0, slotInnerBytes, stream);
+            // TQ_PASSTHROUGH_SCRATCH=1: bypass K3+K6. Copy K1+K2
+            // round-tripped K and V directly into scratchPool slot
+            // layout for the *new* tokens; trust that the parent's
+            // own K/V cache write (which will land in scratchPool
+            // for this layer) populates the rest. Isolates whether
+            // K3/K6 layered round-trip is the bug vs the patch path.
+            bool const passthrough = []() {
+                char const* v = std::getenv("TQ_PASSTHROUGH_SCRATCH");
+                return v != nullptr && v[0] == '1';
+            }();
+            int rcK = 0, rcV = 0, rcK6 = 0, rcV6 = 0;
+            if (!passthrough)
+            {
+                rcK = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK, poolBaseShifted,
+                    gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
+                    nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                    /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                    /*k_or_v=*/0, slotInnerBytes, stream);
+                rcV = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV, poolBaseShifted,
+                    gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
+                    nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                    /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                    /*k_or_v=*/0, slotInnerBytes, stream);
+                rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksK,
+                    gQuantState.signs, gQuantState.centroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
+                    static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                    /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                    /*k_or_v=*/0, slotInnerBytes, stream);
+                rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksV,
+                    gQuantState.signs, gQuantState.centroids, mScratchK6V, mTurboquantBits, kDtypeFP16,
+                    static_cast<int>(vBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                    /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                    /*k_or_v=*/0, slotInnerBytes, stream);
+            }
 
             if (rcK == 0 && rcV == 0 && rcK6 == 0 && rcV6 == 0)
             {
