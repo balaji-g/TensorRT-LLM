@@ -117,6 +117,25 @@ private:
     // returns), so a stack-local buffer races with the read. Lives as
     // long as the plugin instance.
     std::int64_t mPatchedPoolPtrs[16] = {0};
+
+    // B.2.2 step 9b — per-enqueue scratch + pool-layout buffer.
+    // Lazily allocated, grown on demand, freed in destroy().
+    // mKContig:    contiguous K slice from QKV [nTokens, n_kv_heads, d_head] fp16
+    // mVContig:    contiguous V slice
+    // mSlotMappingK/V: int32 slot indices per new token
+    // mPhysBlocksK/V:  int32 physical block IDs for K6 to dequantize
+    // mScratchK6K/V:   contiguous K6 output [n_blocks, n_kv_heads, tokens_per_block, d_head]
+    // mScratchPool:    pool-layout buffer that the patched HOST_KV_CACHE_POOL_POINTERS
+    //                  points at; size = (max_active_block_id + 1) * nLayers * kvFactor * slot_inner_bytes
+    void* mKContig{nullptr};       std::size_t mKContigCap{0};
+    void* mVContig{nullptr};       std::size_t mVContigCap{0};
+    std::int32_t* mSlotMappingK{nullptr}; std::size_t mSlotMappingKCap{0};
+    std::int32_t* mSlotMappingV{nullptr}; std::size_t mSlotMappingVCap{0};
+    std::int32_t* mPhysBlocksK{nullptr};  std::size_t mPhysBlocksKCap{0};
+    std::int32_t* mPhysBlocksV{nullptr};  std::size_t mPhysBlocksVCap{0};
+    void* mScratchK6K{nullptr};    std::size_t mScratchK6KCap{0};
+    void* mScratchK6V{nullptr};    std::size_t mScratchK6VCap{0};
+    void* mScratchPool{nullptr};   std::size_t mScratchPoolCap{0};
 };
 
 class TurboquantAttentionPluginCreator : public GPTAttentionPluginCreator

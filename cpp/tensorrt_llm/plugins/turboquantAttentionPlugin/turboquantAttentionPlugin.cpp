@@ -23,9 +23,13 @@
 #include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <set>
+#include <vector>
 
 namespace tensorrt_llm::plugins
 {
@@ -148,6 +152,28 @@ void TurboquantEnqueueWorkspace::free()
 
 namespace
 {
+// Lazy-allocate/grow a device buffer. Returns false on cudaMalloc failure.
+bool ensureBuf(void** buf, std::size_t* cap, std::size_t needBytes)
+{
+    if (needBytes <= *cap)
+        return true;
+    if (*buf)
+    {
+        cudaFree(*buf);
+        *buf = nullptr;
+        *cap = 0;
+    }
+    if (cudaMalloc(buf, needBytes) != cudaSuccess)
+        return false;
+    *cap = needBytes;
+    return true;
+}
+template <typename T>
+bool ensureBufT(T** buf, std::size_t* cap, std::size_t needBytes)
+{
+    return ensureBuf(reinterpret_cast<void**>(buf), cap, needBytes);
+}
+
 bool ensureWorkspace(TurboquantEnqueueWorkspace& ws, int nTokens, int nHeads, int dHead, int bits)
 {
     std::size_t packedBytes = static_cast<std::size_t>(nTokens) * nHeads * dHead * bits / 8;
@@ -583,20 +609,220 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     }
     patchedInputs[0] = mWorkspace.kv_out;
 
-    // B.2.2 step 9a (re-enabled) — pool-pointer no-op patch.
-    // The earlier failure was masked by the K3+K6 stride bug; with
-    // slot_inner_bytes plumbed through (commit 85f353bf2), strides
-    // are correct and the no-op patch should now also be a true
-    // no-op. Per-enqueue copy of HOST_KV_CACHE_POOL_POINTERS' int64
-    // values into a heap-stable plugin-member buffer mPatchedPoolPtrs,
-    // then set patchedInputs[poolPtrsIdx] to the member buffer.
-    // Identical pointer values → identical behaviour.
+    // B.2.2 step 9b — K3 + K6 + scratch + pool-ptr swap.
+    // Real persistent path: write new K/V into the real pool via K3
+    // (round-tripped via the layered launcher), dequantize active
+    // blocks from the pool via K6 into a pool-layout scratch buffer
+    // that the inner GPTAttention then reads (via the patched pool
+    // pointer) instead of the real pool. Without B.3b the real pool
+    // is still fp16-shaped, so K3 writes packed bytes into the first
+    // portion of each slot and leaves the rest unused — wasteful but
+    // semantically correct. Once B.3b shrinks the pool, the same K3
+    // call lands at exactly slot_inner = packed + norms.
     //
-    // Once verified, step 9b replaces mPatchedPoolPtrs[0] with a
-    // device pointer to a K6-dequant scratch buffer so the inner
-    // gpt_attention reads decompressed K/V history from scratch.
+    // K1+K2 streaming round-trip on inputs[0] (mWorkspace.kv_out)
+    // stays the source of K/V we slice into K3 — that keeps the
+    // semantics consistent: scratch[N] (written by inner from
+    // patchedInputs[0] = mWorkspace.kv_out) matches K6's dequant of
+    // K3's persisted value (both round-tripped from the same fresh
+    // K/V), so FMHA sees fully round-tripped tokens 0..N.
+    bool stepB22Done = false;
+    if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)
+        && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)
+        && isEntryUsed(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)
+        && isEntryUsed(IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS))
+    {
+        auto poolPtrsIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
+        auto mappingIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING);
+        auto hBOIdx = getIdx(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS);
+        auto pastIdx = getIdx(IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS);
+
+        std::int64_t const* hPoolPtrs = static_cast<std::int64_t const*>(inputs[poolPtrsIdx]);
+        std::int32_t const* hMapping = static_cast<std::int32_t const*>(inputs[mappingIdx]);
+        std::int32_t const* hBlockOffsets = static_cast<std::int32_t const*>(inputs[hBOIdx]);
+        std::int32_t const* hPastKv = static_cast<std::int32_t const*>(inputs[pastIdx]);
+
+        int const nLayersPerPool = inputDesc[mappingIdx].dims.d[0];
+        int const nPools = inputDesc[poolPtrsIdx].dims.d[0];
+        constexpr int kvFactor = 2;
+        constexpr int kTokensPerBlockB22 = 32;
+
+        int const poolIdxForLayer = hMapping[this->mLayerIdx * 2 + 0];
+        int const relativeLayer = hMapping[this->mLayerIdx * 2 + 1];
+        void* const poolBase
+            = reinterpret_cast<void*>(static_cast<std::uintptr_t>(hPoolPtrs[poolIdxForLayer * 2 + 0]));
+
+        int const nKvHeadsL = this->mNumKVHeads;
+        int const nQHeadsL = this->mNumHeads;
+        int const dHeadL = this->mHeadSize;
+        int const slotInnerBytes
+            = nKvHeadsL * kTokensPerBlockB22 * dHeadL * static_cast<int>(sizeof(std::uint16_t));
+
+        auto const& boDesc = inputDesc[hBOIdx];
+        int const batchSize = boDesc.dims.d[0];
+        int const beamWidth = boDesc.dims.d[1];
+        int const maxBlocksPerSeq = boDesc.dims.d[3];
+
+        // Compute per-token slot mappings + active block ID sets.
+        // Single-sequence prefill / single-token decode assumption
+        // (the smoke). Multi-seq batches: TODO follow-up.
+        std::vector<std::int32_t> hSlotK(nTokens), hSlotV(nTokens);
+        std::set<std::int32_t> kBlocksSet, vBlocksSet;
+        int const s = 0;
+        int const seqPast = (batchSize > 0) ? hPastKv[s] : 0;
+        int const seqTotal = seqPast + nTokens;
+        int const nFullBlocks = (seqTotal + kTokensPerBlockB22 - 1) / kTokensPerBlockB22;
+        for (int t = 0; t < nTokens; ++t)
+        {
+            int absPos = seqPast + t;
+            int blockInSeq = absPos / kTokensPerBlockB22;
+            int offInBlock = absPos - blockInSeq * kTokensPerBlockB22;
+            int physK
+                = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 0) * maxBlocksPerSeq + blockInSeq];
+            int physV
+                = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 1) * maxBlocksPerSeq + blockInSeq];
+            hSlotK[t] = physK * kTokensPerBlockB22 + offInBlock;
+            hSlotV[t] = physV * kTokensPerBlockB22 + offInBlock;
+        }
+        for (int b = 0; b < nFullBlocks; ++b)
+        {
+            int physK = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 0) * maxBlocksPerSeq + b];
+            int physV = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 1) * maxBlocksPerSeq + b];
+            kBlocksSet.insert(physK);
+            vBlocksSet.insert(physV);
+        }
+        std::vector<std::int32_t> kBlockList(kBlocksSet.begin(), kBlocksSet.end());
+        std::vector<std::int32_t> vBlockList(vBlocksSet.begin(), vBlocksSet.end());
+        int const maxBlockId
+            = std::max(kBlocksSet.empty() ? 0 : *kBlocksSet.rbegin(),
+                       vBlocksSet.empty() ? 0 : *vBlocksSet.rbegin());
+
+        // Lazy-grow per-instance buffers.
+        std::size_t const kvBytesPerToken
+            = static_cast<std::size_t>(nKvHeadsL) * dHeadL * sizeof(std::uint16_t);
+        std::size_t const kContigBytes = static_cast<std::size_t>(nTokens) * kvBytesPerToken;
+        std::size_t const scratchK6KBytes
+            = static_cast<std::size_t>(kBlockList.size()) * slotInnerBytes;
+        std::size_t const scratchK6VBytes
+            = static_cast<std::size_t>(vBlockList.size()) * slotInnerBytes;
+        std::size_t const perBlockPoolBytes
+            = static_cast<std::size_t>(nLayersPerPool) * kvFactor * slotInnerBytes;
+        std::size_t const scratchPoolBytes
+            = static_cast<std::size_t>(maxBlockId + 1) * perBlockPoolBytes;
+
+        bool ok = ensureBuf(&mKContig, &mKContigCap, kContigBytes)
+            && ensureBuf(&mVContig, &mVContigCap, kContigBytes)
+            && ensureBufT(&mSlotMappingK, &mSlotMappingKCap, nTokens * sizeof(std::int32_t))
+            && ensureBufT(&mSlotMappingV, &mSlotMappingVCap, nTokens * sizeof(std::int32_t))
+            && ensureBufT(&mPhysBlocksK, &mPhysBlocksKCap, kBlockList.size() * sizeof(std::int32_t))
+            && ensureBufT(&mPhysBlocksV, &mPhysBlocksVCap, vBlockList.size() * sizeof(std::int32_t))
+            && ensureBuf(&mScratchK6K, &mScratchK6KCap, scratchK6KBytes)
+            && ensureBuf(&mScratchK6V, &mScratchK6VCap, scratchK6VBytes)
+            && ensureBuf(&mScratchPool, &mScratchPoolCap, scratchPoolBytes);
+
+        if (ok)
+        {
+            // Copy host metadata to device.
+            cudaMemcpyAsync(
+                mSlotMappingK, hSlotK.data(), nTokens * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(
+                mSlotMappingV, hSlotV.data(), nTokens * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(mPhysBlocksK, kBlockList.data(), kBlockList.size() * sizeof(std::int32_t),
+                cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(mPhysBlocksV, vBlockList.data(), vBlockList.size() * sizeof(std::int32_t),
+                cudaMemcpyHostToDevice, stream);
+
+            // Slice K and V from the K1+K2 round-tripped buffer
+            // (mWorkspace.kv_out) so the values K3 persists match
+            // what inner will write into scratch[N] later.
+            std::size_t const qkvStrideBytes
+                = static_cast<std::size_t>(nQHeadsL + 2 * nKvHeadsL) * dHeadL * sizeof(std::uint16_t);
+            std::size_t const kSrcOffsetBytes
+                = static_cast<std::size_t>(nQHeadsL) * dHeadL * sizeof(std::uint16_t);
+            std::size_t const vSrcOffsetBytes
+                = static_cast<std::size_t>(nQHeadsL + nKvHeadsL) * dHeadL * sizeof(std::uint16_t);
+            cudaMemcpy2DAsync(mKContig, kvBytesPerToken,
+                static_cast<std::uint8_t const*>(mWorkspace.kv_out) + kSrcOffsetBytes, qkvStrideBytes,
+                kvBytesPerToken, nTokens, cudaMemcpyDeviceToDevice, stream);
+            cudaMemcpy2DAsync(mVContig, kvBytesPerToken,
+                static_cast<std::uint8_t const*>(mWorkspace.kv_out) + vSrcOffsetBytes, qkvStrideBytes,
+                kvBytesPerToken, nTokens, cudaMemcpyDeviceToDevice, stream);
+
+            // K3 K and V into the real persistent pool.
+            int rcK = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK, poolBase,
+                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
+                nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22, nLayersPerPool, kvFactor, relativeLayer,
+                /*k_or_v=*/0, slotInnerBytes, stream);
+            int rcV = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV, poolBase,
+                gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
+                nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22, nLayersPerPool, kvFactor, relativeLayer,
+                /*k_or_v=*/1, slotInnerBytes, stream);
+
+            // K6 dequant active K and V blocks from the real pool into
+            // contiguous scratch_k6 buffers.
+            int rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBase, mPhysBlocksK, gQuantState.signs,
+                gQuantState.centroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
+                static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22, nLayersPerPool,
+                kvFactor, relativeLayer, /*k_or_v=*/0, slotInnerBytes, stream);
+            int rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBase, mPhysBlocksV, gQuantState.signs,
+                gQuantState.centroids, mScratchK6V, mTurboquantBits, kDtypeFP16,
+                static_cast<int>(vBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22, nLayersPerPool,
+                kvFactor, relativeLayer, /*k_or_v=*/1, slotInnerBytes, stream);
+
+            if (rcK == 0 && rcV == 0 && rcK6 == 0 && rcV6 == 0)
+            {
+                // Zero scratch_pool (uninitialized regions = 0).
+                cudaMemsetAsync(mScratchPool, 0, scratchPoolBytes, stream);
+                // Copy K6 outputs into pool-layout positions in scratch_pool.
+                for (std::size_t i = 0; i < kBlockList.size(); ++i)
+                {
+                    std::size_t dstOff = static_cast<std::size_t>(kBlockList[i]) * perBlockPoolBytes
+                        + static_cast<std::size_t>(relativeLayer) * kvFactor * slotInnerBytes
+                        + 0 * static_cast<std::size_t>(slotInnerBytes);
+                    cudaMemcpyAsync(static_cast<std::uint8_t*>(mScratchPool) + dstOff,
+                        static_cast<std::uint8_t const*>(mScratchK6K) + i * slotInnerBytes, slotInnerBytes,
+                        cudaMemcpyDeviceToDevice, stream);
+                }
+                for (std::size_t i = 0; i < vBlockList.size(); ++i)
+                {
+                    std::size_t dstOff = static_cast<std::size_t>(vBlockList[i]) * perBlockPoolBytes
+                        + static_cast<std::size_t>(relativeLayer) * kvFactor * slotInnerBytes
+                        + 1 * static_cast<std::size_t>(slotInnerBytes);
+                    cudaMemcpyAsync(static_cast<std::uint8_t*>(mScratchPool) + dstOff,
+                        static_cast<std::uint8_t const*>(mScratchK6V) + i * slotInnerBytes, slotInnerBytes,
+                        cudaMemcpyDeviceToDevice, stream);
+                }
+
+                // Build patched pool ptrs with primary = scratch base.
+                int const totalPoolEntries = nPools * 2;
+                int const safeEntries = std::min(totalPoolEntries,
+                    static_cast<int>(sizeof(mPatchedPoolPtrs) / sizeof(std::int64_t)));
+                std::memcpy(mPatchedPoolPtrs, hPoolPtrs, safeEntries * sizeof(std::int64_t));
+                mPatchedPoolPtrs[poolIdxForLayer * 2 + 0]
+                    = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(mScratchPool));
+                patchedInputs[poolPtrsIdx] = mPatchedPoolPtrs;
+                stepB22Done = true;
+
+                static std::atomic<bool> sB22Logged{false};
+                bool expected = false;
+                if (sB22Logged.compare_exchange_strong(expected, true))
+                {
+                    TLLM_LOG_INFO(
+                        "[B.2.2] step 9b ON (layer=%d): K3+K6+scratch+patch active. "
+                        "nTokens=%d seqPast=%d nFullBlocks=%d kBlocks=%zu vBlocks=%zu maxBlockId=%d "
+                        "scratchPoolBytes=%zu",
+                        this->mLayerIdx, nTokens, seqPast, nFullBlocks, kBlockList.size(), vBlockList.size(),
+                        maxBlockId, scratchPoolBytes);
+                }
+            }
+        }
+    }
+
+    // Fallback: if step 9b didn't run (multi-pool, unexpected layout, etc.),
+    // keep the legacy K1+K2-only behavior with no pool-ptr patch — math hook
+    // continues to round-trip via patchedInputs[0] = mWorkspace.kv_out.
     static std::atomic<bool> sPatchDiagLogged{false};
-    if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS))
+    if (!stepB22Done && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS))
     {
         auto poolPtrsIdx = getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS);
         auto const& d = inputDesc[poolPtrsIdx];
@@ -670,6 +896,16 @@ void TurboquantAttentionPlugin::serialize(void* buffer) const noexcept
 void TurboquantAttentionPlugin::destroy() noexcept
 {
     mWorkspace.free();
+    auto freeDev = [](void*& p) { if (p) { cudaFree(p); p = nullptr; } };
+    freeDev(mKContig);     mKContigCap = 0;
+    freeDev(mVContig);     mVContigCap = 0;
+    freeDev(reinterpret_cast<void*&>(mSlotMappingK)); mSlotMappingKCap = 0;
+    freeDev(reinterpret_cast<void*&>(mSlotMappingV)); mSlotMappingVCap = 0;
+    freeDev(reinterpret_cast<void*&>(mPhysBlocksK));  mPhysBlocksKCap = 0;
+    freeDev(reinterpret_cast<void*&>(mPhysBlocksV));  mPhysBlocksVCap = 0;
+    freeDev(mScratchK6K);  mScratchK6KCap = 0;
+    freeDev(mScratchK6V);  mScratchK6VCap = 0;
+    freeDev(mScratchPool); mScratchPoolCap = 0;
     GPTAttentionPlugin::destroy();
 }
 
