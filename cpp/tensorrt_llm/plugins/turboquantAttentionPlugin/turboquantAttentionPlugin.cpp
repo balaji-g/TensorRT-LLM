@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <set>
@@ -628,7 +629,14 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     // K3's persisted value (both round-tripped from the same fresh
     // K/V), so FMHA sees fully round-tripped tokens 0..N.
     bool stepB22Done = false;
-    if (isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)
+    static bool const sStep9bDisabled = []() {
+        char const* v = std::getenv("TQ_DISABLE_STEP9B");
+        bool disabled = (v != nullptr && v[0] == '1');
+        if (disabled) TLLM_LOG_INFO("[B.2.2] step 9b DISABLED via TQ_DISABLE_STEP9B=1 (K1+K2 only)");
+        return disabled;
+    }();
+    if (!sStep9bDisabled
+        && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)
         && isEntryUsed(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)
         && isEntryUsed(IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS)
         && isEntryUsed(IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS))
