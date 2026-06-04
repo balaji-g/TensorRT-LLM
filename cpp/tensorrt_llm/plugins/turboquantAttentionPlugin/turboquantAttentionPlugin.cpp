@@ -428,45 +428,106 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 hSlotK[t] = physBlock * kTokensPerBlock_b22 + offInBlock;
             }
 
+            // Slot mapping for V — uses block_offsets with k_or_v=1.
+            std::vector<int32_t> hSlotV(nTokens);
+            for (int t = 0; t < nTokens; ++t)
+            {
+                int blockInSeq = t / kTokensPerBlock_b22;
+                int offInBlock = t - blockInSeq * kTokensPerBlock_b22;
+                int physBlock
+                    = hBlockOffsets[((0 * beamWidth + 0) * kvFactor + 1) * maxBlocksPerSeq + blockInSeq];
+                hSlotV[t] = physBlock * kTokensPerBlock_b22 + offInBlock;
+            }
+
+            // For K6 read-back, gather active blocks for this batch
+            // (just block 0 in the smoke). For now reconstruct the
+            // physical-block list from hSlotK (one block in the smoke).
+            int const nActiveBlocks = (nTokens + kTokensPerBlock_b22 - 1) / kTokensPerBlock_b22;
+            std::vector<int32_t> hPhysBlocks(nActiveBlocks);
+            for (int b = 0; b < nActiveBlocks; ++b)
+            {
+                hPhysBlocks[b]
+                    = hBlockOffsets[((0 * beamWidth + 0) * kvFactor + 0) * maxBlocksPerSeq + b];
+            }
+
             int32_t* dSlotK = nullptr;
+            int32_t* dSlotV = nullptr;
+            int32_t* dPhysBlocks = nullptr;
             void* dKContig = nullptr;
+            void* dVContig = nullptr;
+            void* dK6ScratchK = nullptr;
+            void* dK6ScratchV = nullptr;
             std::size_t const kContigBytes
                 = static_cast<std::size_t>(nTokens) * nKvHeadsLayer * dHeadLayer * sizeof(std::uint16_t);
-            bool realOk = (cudaMalloc(&dSlotK, nTokens * sizeof(int32_t)) == cudaSuccess);
-            realOk = realOk && (cudaMalloc(&dKContig, kContigBytes) == cudaSuccess);
+            std::size_t const k6ScratchBytes = static_cast<std::size_t>(nActiveBlocks) * nKvHeadsLayer
+                * kTokensPerBlock_b22 * dHeadLayer * sizeof(std::uint16_t);
+            bool realOk = (cudaMalloc(&dSlotK, nTokens * sizeof(int32_t)) == cudaSuccess)
+                && (cudaMalloc(&dSlotV, nTokens * sizeof(int32_t)) == cudaSuccess)
+                && (cudaMalloc(&dPhysBlocks, nActiveBlocks * sizeof(int32_t)) == cudaSuccess)
+                && (cudaMalloc(&dKContig, kContigBytes) == cudaSuccess)
+                && (cudaMalloc(&dVContig, kContigBytes) == cudaSuccess)
+                && (cudaMalloc(&dK6ScratchK, k6ScratchBytes) == cudaSuccess)
+                && (cudaMalloc(&dK6ScratchV, k6ScratchBytes) == cudaSuccess);
             if (realOk)
             {
                 cudaMemcpyAsync(dSlotK, hSlotK.data(), nTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
-                // Slice K out of fused QKV [nTokens, (nQ + 2*nKv)*dHead].
+                cudaMemcpyAsync(dSlotV, hSlotV.data(), nTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+                cudaMemcpyAsync(
+                    dPhysBlocks, hPhysBlocks.data(), nActiveBlocks * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+
+                // Slice K and V out of fused QKV [nTokens, (nQ + 2*nKv)*dHead].
                 std::size_t const qkvStrideBytes
                     = static_cast<std::size_t>(nQHeads + 2 * nKvHeadsLayer) * dHeadLayer * sizeof(std::uint16_t);
                 std::size_t const kSrcOffsetBytes
                     = static_cast<std::size_t>(nQHeads) * dHeadLayer * sizeof(std::uint16_t);
-                std::size_t const kBytesPerToken
+                std::size_t const vSrcOffsetBytes
+                    = static_cast<std::size_t>(nQHeads + nKvHeadsLayer) * dHeadLayer * sizeof(std::uint16_t);
+                std::size_t const kvBytesPerToken
                     = static_cast<std::size_t>(nKvHeadsLayer) * dHeadLayer * sizeof(std::uint16_t);
-                cudaError_t cpyErr = cudaMemcpy2DAsync(dKContig, kBytesPerToken,
-                    static_cast<std::uint8_t const*>(inputs[0]) + kSrcOffsetBytes, qkvStrideBytes, kBytesPerToken,
+                cudaMemcpy2DAsync(dKContig, kvBytesPerToken,
+                    static_cast<std::uint8_t const*>(inputs[0]) + kSrcOffsetBytes, qkvStrideBytes, kvBytesPerToken,
                     nTokens, cudaMemcpyDeviceToDevice, stream);
+                cudaMemcpy2DAsync(dVContig, kvBytesPerToken,
+                    static_cast<std::uint8_t const*>(inputs[0]) + vSrcOffsetBytes, qkvStrideBytes, kvBytesPerToken,
+                    nTokens, cudaMemcpyDeviceToDevice, stream);
+
                 int rcK = tq_kv_quantize_paged_trtllm_layered(dKContig, dSlotK, poolBase, gQuantState.signs,
                     gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16, nTokens, nKvHeadsLayer,
                     dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/0, stream);
+                int rcV = tq_kv_quantize_paged_trtllm_layered(dVContig, dSlotV, poolBase, gQuantState.signs,
+                    gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16, nTokens, nKvHeadsLayer,
+                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/1, stream);
+                int rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBase, dPhysBlocks, gQuantState.signs,
+                    gQuantState.centroids, dK6ScratchK, mTurboquantBits, kDtypeFP16, nActiveBlocks, nKvHeadsLayer,
+                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/0, stream);
+                int rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBase, dPhysBlocks, gQuantState.signs,
+                    gQuantState.centroids, dK6ScratchV, mTurboquantBits, kDtypeFP16, nActiveBlocks, nKvHeadsLayer,
+                    dHeadLayer, kTokensPerBlock_b22, nLayersPerPool, kvFactor, relativeLayer, /*k_or_v=*/1, stream);
                 cudaError_t syncErr2 = cudaStreamSynchronize(stream);
                 TLLM_LOG_INFO(
-                    "[B.2.2] K3 real-pool (layer=%d): pool_idx=%d rel_layer=%d n_layers_in_pool=%d "
-                    "n_pools=%d kv_factor=%d pool_base=%p slot[0]=%d slot[last]=%d cpyErr=%d rcK=%d "
-                    "cudaSync=%d",
-                    this->mLayerIdx, poolIdxForLayer, relativeLayer, nLayersPerPool, nPools, kvFactor, poolBase,
-                    hSlotK.empty() ? -1 : hSlotK.front(), hSlotK.empty() ? -1 : hSlotK.back(),
-                    static_cast<int>(cpyErr), rcK, static_cast<int>(syncErr2));
+                    "[B.2.2] K3+K6 real-pool (layer=%d): rcK=%d rcV=%d rcK6=%d rcV6=%d cudaSync=%d "
+                    "(slotK[0..last]=%d..%d slotV[0..last]=%d..%d active_blocks=%d k6Scratch=%zuB each)",
+                    this->mLayerIdx, rcK, rcV, rcK6, rcV6, static_cast<int>(syncErr2), hSlotK.front(), hSlotK.back(),
+                    hSlotV.front(), hSlotV.back(), nActiveBlocks, k6ScratchBytes);
             }
             else
             {
-                TLLM_LOG_ERROR("[B.2.2] K3 real-pool: cudaMalloc failed");
+                TLLM_LOG_ERROR("[B.2.2] K3+K6 real-pool: cudaMalloc failed");
             }
             if (dSlotK)
                 cudaFree(dSlotK);
+            if (dSlotV)
+                cudaFree(dSlotV);
+            if (dPhysBlocks)
+                cudaFree(dPhysBlocks);
             if (dKContig)
                 cudaFree(dKContig);
+            if (dVContig)
+                cudaFree(dVContig);
+            if (dK6ScratchK)
+                cudaFree(dK6ScratchK);
+            if (dK6ScratchV)
+                cudaFree(dK6ScratchV);
         }
 
         // B.2.2 reconnaissance — log the input tensor descriptors we'll
