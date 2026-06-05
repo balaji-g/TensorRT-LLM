@@ -629,20 +629,36 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     // K3's persisted value (both round-tripped from the same fresh
     // K/V), so FMHA sees fully round-tripped tokens 0..N.
     bool stepB22Done = false;
-    // step 9b (K3+K6+scratch+patch) is opt-in via TQ_ENABLE_STEP9B=1.
-    // Default: disabled, because the pre-enqueue K3 captures K BEFORE
-    // the parent's RoPE step. The parent's RoPE-applied K then lands
-    // only in scratchPool (ephemeral) and is lost between enqueues —
-    // so on the next decode, K6 dequant returns pre-RoPE K from the
-    // real pool while FMHA expects post-RoPE K, collapsing decode to
-    // a single-token loop ("is is is..."). The fix is post-enqueue
-    // K3 (capture scratchPool's RoPE-applied K back into the real
-    // pool) — pending in B.2.2 stage 2.
+    // Stage-2 post-enqueue context — populated below if step 9b ran
+    // its pre-enqueue half successfully. Drives the post-enqueue K3
+    // that captures parent's post-RoPE K from mScratchPool into the
+    // persistent real pool.
+    struct Stage2Ctx
+    {
+        bool active{false};
+        void* poolBaseShifted{nullptr};
+        int slotInnerBytes{0};
+        int nKvHeads{0};
+        int dHead{0};
+        int blockInSeq{0};    // single-block assumption (TODO multi-block prefill)
+        int offInBlockFirst{0};
+        int kFlat{0};
+        int vFlat{0};
+        int turboquantBits{0};
+    } stage2;
+
+    // step 9b is opt-in via TQ_ENABLE_STEP9B=1. Stage 2 (default in
+    // this build): K6 -> scratchPool BEFORE parent's enqueue (load
+    // history), patch pool ptr, run parent (which writes post-RoPE K
+    // + V into scratchPool); AFTER parent returns, gather the new
+    // tokens from scratchPool and K3 quantize into the persistent
+    // real pool. Closes the persistence loop with post-RoPE K so
+    // the next decode's K6 dequant matches FMHA's expectation.
     static bool const sStep9bEnabled = []() {
         char const* v = std::getenv("TQ_ENABLE_STEP9B");
         bool enabled = (v != nullptr && v[0] == '1');
         TLLM_LOG_INFO("[B.2.2] step 9b %s (TQ_ENABLE_STEP9B=%s)",
-                      enabled ? "ENABLED" : "DISABLED (K1+K2 only)",
+                      enabled ? "ENABLED (stage 2 — post-enqueue K3)" : "DISABLED (K1+K2 only)",
                       v ? v : "<unset>");
         return enabled;
     }();
@@ -675,6 +691,7 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
 
         int const nKvHeadsL = this->mNumKVHeads;
         int const nQHeadsL = this->mNumHeads;
+        (void)nQHeadsL;
         int const dHeadL = this->mHeadSize;
         int const slotInnerBytes
             = nKvHeadsL * kTokensPerBlockB22 * dHeadL * static_cast<int>(sizeof(std::uint16_t));
@@ -778,22 +795,6 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             cudaMemcpyAsync(mPhysBlocksV, vBlockList.data(), vBlockList.size() * sizeof(std::int32_t),
                 cudaMemcpyHostToDevice, stream);
 
-            // Slice K and V from the K1+K2 round-tripped buffer
-            // (mWorkspace.kv_out) so the values K3 persists match
-            // what inner will write into scratch[N] later.
-            std::size_t const qkvStrideBytes
-                = static_cast<std::size_t>(nQHeadsL + 2 * nKvHeadsL) * dHeadL * sizeof(std::uint16_t);
-            std::size_t const kSrcOffsetBytes
-                = static_cast<std::size_t>(nQHeadsL) * dHeadL * sizeof(std::uint16_t);
-            std::size_t const vSrcOffsetBytes
-                = static_cast<std::size_t>(nQHeadsL + nKvHeadsL) * dHeadL * sizeof(std::uint16_t);
-            cudaMemcpy2DAsync(mKContig, kvBytesPerToken,
-                static_cast<std::uint8_t const*>(mWorkspace.kv_out) + kSrcOffsetBytes, qkvStrideBytes,
-                kvBytesPerToken, nTokens, cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpy2DAsync(mVContig, kvBytesPerToken,
-                static_cast<std::uint8_t const*>(mWorkspace.kv_out) + vSrcOffsetBytes, qkvStrideBytes,
-                kvBytesPerToken, nTokens, cudaMemcpyDeviceToDevice, stream);
-
             // Shift pool_base by L*kvFactor*slot_inner so each
             // (block_offset_value)-indexed slot lines up with the
             // address the parent would compute as
@@ -804,42 +805,25 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             void* const poolBaseShifted
                 = static_cast<std::uint8_t*>(poolBase) + layerStrideBytes;
 
-            // TQ_PASSTHROUGH_SCRATCH=1: bypass K3+K6. Copy K1+K2
-            // round-tripped K and V directly into scratchPool slot
-            // layout for the *new* tokens; trust that the parent's
-            // own K/V cache write (which will land in scratchPool
-            // for this layer) populates the rest. Isolates whether
-            // K3/K6 layered round-trip is the bug vs the patch path.
-            bool const passthrough = []() {
-                char const* v = std::getenv("TQ_PASSTHROUGH_SCRATCH");
-                return v != nullptr && v[0] == '1';
-            }();
-            int rcK = 0, rcV = 0, rcK6 = 0, rcV6 = 0;
-            if (!passthrough)
-            {
-                rcK = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK, poolBaseShifted,
-                    gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
-                    nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22,
-                    /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-                    /*k_or_v=*/0, slotInnerBytes, stream);
-                rcV = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV, poolBaseShifted,
-                    gQuantState.signs, gQuantState.centroids, gQuantState.thresholds, mTurboquantBits, kDtypeFP16,
-                    nTokens, nKvHeadsL, dHeadL, kTokensPerBlockB22,
-                    /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-                    /*k_or_v=*/0, slotInnerBytes, stream);
-                rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksK,
-                    gQuantState.signs, gQuantState.centroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
-                    static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
-                    /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-                    /*k_or_v=*/0, slotInnerBytes, stream);
-                rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksV,
-                    gQuantState.signs, gQuantState.centroids, mScratchK6V, mTurboquantBits, kDtypeFP16,
-                    static_cast<int>(vBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
-                    /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-                    /*k_or_v=*/0, slotInnerBytes, stream);
-            }
+            // K6 dequant active K and V slots from the real pool into
+            // contiguous scratch_k6 buffers. For the very first enqueue
+            // the real pool is uninitialized; we accept K6's output as
+            // the history view regardless — on T=0 prefill there is no
+            // history yet (pastBefore=0) so what K6 dequants is unused.
+            // From T=1 onward, post-enqueue K3 (below) keeps the real
+            // pool populated with parent's RoPE-applied K and V.
+            int rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksK,
+                gQuantState.signs, gQuantState.centroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
+                static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                /*k_or_v=*/0, slotInnerBytes, stream);
+            int rcV6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksV,
+                gQuantState.signs, gQuantState.centroids, mScratchK6V, mTurboquantBits, kDtypeFP16,
+                static_cast<int>(vBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
+                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                /*k_or_v=*/0, slotInnerBytes, stream);
 
-            if (rcK == 0 && rcV == 0 && rcK6 == 0 && rcV6 == 0)
+            if (rcK6 == 0 && rcV6 == 0)
             {
                 cudaMemsetAsync(mScratchPool, 0, scratchPoolBytes, stream);
                 // Place K6 fp16 outputs at the flat slot offsets so
@@ -875,16 +859,42 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 patchedInputs[poolPtrsIdx] = mPatchedPoolPtrs;
                 stepB22Done = true;
 
+                // Single-block assumption (smoke: ≤ 32 new tokens in
+                // one logical block — covers decode + short prefill).
+                // For longer prefill that crosses block boundaries,
+                // the post-enqueue gather + K3 needs to run per
+                // contiguous (blockInSeq) segment; TODO follow-up.
+                int const absPosFirst = seqPastBefore;
+                int const absPosLast = seqTotalAfter - 1;
+                int const blockFirst = absPosFirst / kTokensPerBlockB22;
+                int const blockLast = absPosLast / kTokensPerBlockB22;
+                if (blockFirst == blockLast)
+                {
+                    stage2.active = true;
+                    stage2.poolBaseShifted = poolBaseShifted;
+                    stage2.slotInnerBytes = slotInnerBytes;
+                    stage2.nKvHeads = nKvHeadsL;
+                    stage2.dHead = dHeadL;
+                    stage2.blockInSeq = blockFirst;
+                    stage2.offInBlockFirst = absPosFirst - blockFirst * kTokensPerBlockB22;
+                    stage2.kFlat
+                        = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 0) * maxBlocksPerSeq + blockFirst];
+                    stage2.vFlat
+                        = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 1) * maxBlocksPerSeq + blockFirst];
+                    stage2.turboquantBits = mTurboquantBits;
+                }
+
                 static std::atomic<bool> sB22Logged{false};
                 bool expected = false;
                 if (sB22Logged.compare_exchange_strong(expected, true))
                 {
                     TLLM_LOG_INFO(
-                        "[B.2.2] step 9b ON (layer=%d): K3+K6+scratch+patch active. "
+                        "[B.2.2] step 9b stage 2 (layer=%d): K6 pre-enqueue + K3 post-enqueue. "
                         "nTokens=%d pastBefore=%d totalAfter=%d nFullBlocks=%d kFlat=%zu vFlat=%zu "
-                        "maxFlatSlot=%d scratchPoolBytes=%zu layerStrideBytes=%zu",
+                        "maxFlatSlot=%d scratchPoolBytes=%zu layerStrideBytes=%zu stage2.active=%d",
                         this->mLayerIdx, nTokens, seqPastBefore, seqTotalAfter, nFullBlocks, kBlockList.size(),
-                        vBlockList.size(), maxFlatSlot, scratchPoolBytes, layerStrideBytes);
+                        vBlockList.size(), maxFlatSlot, scratchPoolBytes, layerStrideBytes,
+                        stage2.active ? 1 : 0);
                 }
             }
         }
@@ -918,7 +928,84 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 mPatchedPoolPtrs[0], mPatchedPoolPtrs[1]);
         }
     }
-    return GPTAttentionPlugin::enqueue(inputDesc, outputDesc, patchedInputs, outputs, workspace, stream);
+    int const parentRc
+        = GPTAttentionPlugin::enqueue(inputDesc, outputDesc, patchedInputs, outputs, workspace, stream);
+
+    // Stage 2 post-enqueue: gather parent's RoPE-applied K + V from
+    // mScratchPool (where parent just wrote them) and K3 quantize
+    // into the persistent real pool so the NEXT enqueue's K6 dequant
+    // returns post-RoPE K matching FMHA's expectation.
+    if (parentRc == 0 && stage2.active)
+    {
+        constexpr int kTokensPerBlock_s2 = 32;
+        int const nKvHeadsL = stage2.nKvHeads;
+        int const dHeadL = stage2.dHead;
+        std::size_t const headRowBytesInSlot
+            = static_cast<std::size_t>(kTokensPerBlock_s2) * dHeadL * sizeof(std::uint16_t); // 8 KB
+        std::size_t const perTokenBytesDst
+            = static_cast<std::size_t>(nKvHeadsL) * dHeadL * sizeof(std::uint16_t); // 2 KB
+        std::size_t const tokenBytes
+            = static_cast<std::size_t>(dHeadL) * sizeof(std::uint16_t); // 256 B for fp16 d_head=128
+
+        // Per-head 2D copy from scratchPool's slot layout
+        // [n_kv_heads, tokens_per_block, d_head] -> contiguous
+        // [n_tokens, n_kv_heads, d_head] staging buffer (mKContig
+        // / mVContig). src_pitch = tokenBytes (consecutive tokens
+        // within head h); dst_pitch = perTokenBytesDst (jump
+        // between tokens in staging across all heads).
+        std::size_t const kSlotBase
+            = static_cast<std::size_t>(stage2.kFlat) * stage2.slotInnerBytes;
+        std::size_t const vSlotBase
+            = static_cast<std::size_t>(stage2.vFlat) * stage2.slotInnerBytes;
+        std::size_t const offBytesInRow
+            = static_cast<std::size_t>(stage2.offInBlockFirst) * tokenBytes;
+
+        for (int h = 0; h < nKvHeadsL; ++h)
+        {
+            std::uint8_t const* srcK
+                = static_cast<std::uint8_t const*>(mScratchPool) + kSlotBase
+                + static_cast<std::size_t>(h) * headRowBytesInSlot + offBytesInRow;
+            std::uint8_t* dstK
+                = static_cast<std::uint8_t*>(mKContig) + static_cast<std::size_t>(h) * tokenBytes;
+            cudaMemcpy2DAsync(dstK, perTokenBytesDst, srcK, tokenBytes,
+                tokenBytes, nTokens, cudaMemcpyDeviceToDevice, stream);
+
+            std::uint8_t const* srcV
+                = static_cast<std::uint8_t const*>(mScratchPool) + vSlotBase
+                + static_cast<std::size_t>(h) * headRowBytesInSlot + offBytesInRow;
+            std::uint8_t* dstV
+                = static_cast<std::uint8_t*>(mVContig) + static_cast<std::size_t>(h) * tokenBytes;
+            cudaMemcpy2DAsync(dstV, perTokenBytesDst, srcV, tokenBytes,
+                tokenBytes, nTokens, cudaMemcpyDeviceToDevice, stream);
+        }
+
+        // K3 quantize gathered K / V into the persistent real pool
+        // at the new-token slot positions. Same flat-slot addressing
+        // as the pre-enqueue K6: n_layers_per_pool=1, kv_factor=1,
+        // relative_layer=0, k_or_v=0; pool_base already shifted.
+        int rcK3K = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK,
+            stage2.poolBaseShifted, gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
+            stage2.turboquantBits, kDtypeFP16, nTokens, nKvHeadsL, dHeadL, kTokensPerBlock_s2,
+            /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+            /*k_or_v=*/0, stage2.slotInnerBytes, stream);
+        int rcK3V = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV,
+            stage2.poolBaseShifted, gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
+            stage2.turboquantBits, kDtypeFP16, nTokens, nKvHeadsL, dHeadL, kTokensPerBlock_s2,
+            /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+            /*k_or_v=*/0, stage2.slotInnerBytes, stream);
+
+        static std::atomic<bool> sStage2Logged{false};
+        bool expected = false;
+        if (sStage2Logged.compare_exchange_strong(expected, true))
+        {
+            TLLM_LOG_INFO(
+                "[B.2.2] step 9b stage 2 post-enqueue (layer=%d): K3 K rc=%d V rc=%d "
+                "(gather: blockInSeq=%d offFirst=%d kFlat=%d vFlat=%d nTokens=%d)",
+                this->mLayerIdx, rcK3K, rcK3V, stage2.blockInSeq, stage2.offInBlockFirst,
+                stage2.kFlat, stage2.vFlat, nTokens);
+        }
+    }
+    return parentRc;
 }
 
 char const* TurboquantAttentionPlugin::getPluginType() const noexcept
