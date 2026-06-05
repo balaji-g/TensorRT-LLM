@@ -1215,6 +1215,54 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 this->mLayerIdx, rcK3K, rcK3V, stage2.blockInSeq, stage2.offInBlockFirst,
                 stage2.kFlat, stage2.vFlat, nTokens);
         }
+
+        // TQ_RT_SELFCHECK=1: round-trip K6-dequant the K slot we just K3'd
+        // back into a fresh temp buffer and compare element-wise to
+        // mKContig (the K3 input). This isolates whether the K3+K6
+        // layered launcher pair is numerically near-lossless at bits=8,
+        // separately from the stage-2 plumbing. Fires once for layer 0,
+        // first enqueue.
+        static bool const sRtSelfCheck = []() {
+            char const* v = std::getenv("TQ_RT_SELFCHECK");
+            return v != nullptr && v[0] == '1';
+        }();
+        static std::atomic<bool> sRtFired{false};
+        if (sRtSelfCheck && this->mLayerIdx == 0)
+        {
+            bool exp2 = false;
+            if (sRtFired.compare_exchange_strong(exp2, true))
+            {
+                std::size_t const rtBytes = static_cast<std::size_t>(kBlockList.size()) * stage2.slotInnerBytes;
+                void* rtK = nullptr;
+                if (cudaMalloc(&rtK, rtBytes) == cudaSuccess)
+                {
+                    tq_kv_dequantize_paged_trtllm_layered(stage2.poolBaseShifted, mPhysBlocksK,
+                        gQuantState.signs, gQuantStateK.active ? gQuantStateK.centroids : gQuantState.centroids,
+                        rtK, stage2.turboquantBits, kDtypeFP16,
+                        static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlock_s2,
+                        /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                        /*k_or_v=*/0, stage2.slotInnerBytes, stream);
+                    cudaStreamSynchronize(stream);
+                    // Copy first 8 fp16 of rtK[head=0, slot=offFirst] vs mKContig[t=0, head=0].
+                    std::size_t const slotInBytes
+                        = static_cast<std::size_t>(stage2.offInBlockFirst) * dHeadL * sizeof(std::uint16_t);
+                    std::uint16_t rtVals[8] = {0}, srcVals[8] = {0};
+                    cudaMemcpy(rtVals,
+                        static_cast<std::uint8_t const*>(rtK) + slotInBytes,
+                        sizeof(rtVals), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(srcVals, mKContig, sizeof(srcVals), cudaMemcpyDeviceToHost);
+                    TLLM_LOG_INFO("[B.2.2 stage 4 self-check] K3+K6 round-trip layer=0 head=0 token=%d first 8 fp16: "
+                                  "src=[%04x %04x %04x %04x %04x %04x %04x %04x] "
+                                  "rt =[%04x %04x %04x %04x %04x %04x %04x %04x]",
+                        stage2.offInBlockFirst,
+                        srcVals[0], srcVals[1], srcVals[2], srcVals[3],
+                        srcVals[4], srcVals[5], srcVals[6], srcVals[7],
+                        rtVals[0], rtVals[1], rtVals[2], rtVals[3],
+                        rtVals[4], rtVals[5], rtVals[6], rtVals[7]);
+                    cudaFree(rtK);
+                }
+            }
+        }
     }
     return parentRc;
 }
