@@ -136,6 +136,12 @@ private:
     void* mScratchK6K{nullptr};    std::size_t mScratchK6KCap{0};
     void* mScratchK6V{nullptr};    std::size_t mScratchK6VCap{0};
     void* mScratchPool{nullptr};   std::size_t mScratchPoolCap{0};
+    // Sequence-block IDs for K6's scratch blocks (used by RoPE-forward to
+    // compute absolute token positions). mSeqBlockIdsK[i] = sequence-block
+    // index of scratch block i (e.g., 0 for the first 32 tokens, 1 for the
+    // next 32, etc.). Same for V.
+    std::int32_t* mSeqBlockIdsK{nullptr}; std::size_t mSeqBlockIdsKCap{0};
+    std::int32_t* mSeqBlockIdsV{nullptr}; std::size_t mSeqBlockIdsVCap{0};
 };
 
 class TurboquantAttentionPluginCreator : public GPTAttentionPluginCreator

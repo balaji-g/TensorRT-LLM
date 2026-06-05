@@ -90,4 +90,15 @@ int tq_kv_dequantize_paged_trtllm_layered(void const* pool_base, int32_t const* 
     int n_kv_heads, int d_head, int tokens_per_block, int n_layers_per_pool, int kv_factor, int relative_layer,
     int k_or_v, int slot_inner_bytes, void* stream);
 
+// Apply Llama-style RoPE (GPT-NeoX layout: rotate pairs (d, d + rotary_dim/2))
+// in-place to a K buffer in `[n_scratch_blocks, n_kv_heads, tokens_per_block,
+// d_head]` layout. Token absolute position for the (scratch_block_idx,
+// slot_in_block) element is `d_seq_block_ids[scratch_block_idx] *
+// tokens_per_block + slot_in_block`. This is the "α" path of M12.4 B.2.2:
+// K6 dequant produces pre-RoPE K; this kernel re-applies RoPE so the
+// inner FMHA sees post-RoPE K-history that matches what it'd compute
+// fresh from Q on this step.
+int tq_apply_rope_forward_inplace(void* k, int n_scratch_blocks, int n_kv_heads, int tokens_per_block,
+    int d_head, int rotary_dim, float rotary_base, int32_t const* d_seq_block_ids, int dtype, void* stream);
+
 } // extern "C"

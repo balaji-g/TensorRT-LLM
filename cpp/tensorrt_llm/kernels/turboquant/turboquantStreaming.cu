@@ -1117,6 +1117,93 @@ extern "C" int tq_kv_dequantize_paged_trtllm_layered(
 }
 
 // =====================================================================
+// RoPE forward (Llama GPT-NeoX style). Applied to a K buffer in
+// `[n_scratch_blocks, n_kv_heads, tokens_per_block, d_head]` layout
+// (the K6 dequant output) so the inner FMHA sees post-RoPE K-history.
+// This is the "α" path of M12.4 B.2.2 — K is K3+K6 round-tripped
+// pre-RoPE; we apply RoPE on dequant so the noise stays in the same
+// pre-RoPE basis as Q's K1+K2 noise and cancels in the Q·K dot
+// product. Validated numerically in
+// scripts/m12_b22_validate_option_alpha.py.
+//
+// Layout: rotate pair (d, d + rotary_dim/2) by angle `pos *
+// base^(-2d/rotary_dim)` where `pos = d_seq_block_ids[scratch_block_idx]
+// * tokens_per_block + slot_in_block`. d_head dims outside
+// `[0, rotary_dim)` are untouched. Currently fp16 only.
+// =====================================================================
+
+template <typename T>
+__global__ void apply_rope_forward_kernel(
+    T*             __restrict__ k,                 // [n_blocks, n_heads, tokens_per_block, d_head]
+    int32_t const* __restrict__ d_seq_block_ids,    // [n_blocks]
+    int            n_kv_heads,
+    int            tokens_per_block,
+    int            d_head,
+    int            rotary_dim,
+    float          rotary_base)
+{
+    int const scratch_block_idx = blockIdx.x;
+    int const slot_in_block     = blockIdx.y;
+    int const kv_head           = blockIdx.z;
+    int const tid               = threadIdx.x;
+    int const half              = rotary_dim >> 1;
+    if (tid >= half) return;
+
+    int const seq_block = d_seq_block_ids[scratch_block_idx];
+    int const absolute_position = seq_block * tokens_per_block + slot_in_block;
+
+    float const inv_freq = powf(rotary_base, -2.0f * (float)tid / (float)rotary_dim);
+    float const angle    = (float)absolute_position * inv_freq;
+    float c, s;
+    __sincosf(angle, &s, &c);
+
+    size_t const base = ((size_t)scratch_block_idx * n_kv_heads + kv_head) * tokens_per_block + slot_in_block;
+    size_t const idx0 = base * d_head + tid;
+    size_t const idx1 = base * d_head + tid + half;
+
+    float x0 = widen_to_float<T>(k[idx0]);
+    float x1 = widen_to_float<T>(k[idx1]);
+
+    k[idx0] = narrow_from_float<T>(x0 * c - x1 * s);
+    k[idx1] = narrow_from_float<T>(x0 * s + x1 * c);
+}
+
+extern "C" int tq_apply_rope_forward_inplace(
+    void*          k,
+    int            n_scratch_blocks,
+    int            n_kv_heads,
+    int            tokens_per_block,
+    int            d_head,
+    int            rotary_dim,
+    float          rotary_base,
+    int32_t const* d_seq_block_ids,
+    int            dtype,
+    void*          stream_v)
+{
+    if (n_scratch_blocks <= 0 || n_kv_heads <= 0 || tokens_per_block <= 0) return cudaErrorInvalidValue;
+    if (d_head <= 0 || rotary_dim <= 0 || rotary_dim > d_head) return cudaErrorInvalidValue;
+    if ((rotary_dim & 1) != 0) return cudaErrorInvalidValue;
+    if (dtype != TQ_DTYPE_FP16 && dtype != TQ_DTYPE_BF16) return cudaErrorInvalidValue;
+
+    dim3 grid(n_scratch_blocks, tokens_per_block, n_kv_heads);
+    dim3 threads(rotary_dim / 2);
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_v);
+    if (dtype == TQ_DTYPE_FP16)
+    {
+        apply_rope_forward_kernel<__half><<<grid, threads, 0, stream>>>(
+            static_cast<__half*>(k), d_seq_block_ids, n_kv_heads, tokens_per_block, d_head,
+            rotary_dim, rotary_base);
+    }
+    else
+    {
+        apply_rope_forward_kernel<__nv_bfloat16><<<grid, threads, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(k), d_seq_block_ids, n_kv_heads, tokens_per_block, d_head,
+            rotary_dim, rotary_base);
+    }
+    return (int)cudaGetLastError();
+}
+
+// =====================================================================
 // K5 — paged attention decode (docs/KERNELS.md §3.4.3).
 //
 // One CUDA block per (seq, q_head). For each sequence:
