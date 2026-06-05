@@ -785,6 +785,8 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         int kFlat{0};
         int vFlat{0};
         int turboquantBits{0};
+        int nKBlocks{0};
+        int nVBlocks{0};
     } stage2;
 
     // step 9b is opt-in via TQ_ENABLE_STEP9B=1. Stage 2 (default in
@@ -1030,6 +1032,8 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                     stage2.vFlat
                         = hBlockOffsets[((s * beamWidth + 0) * kvFactor + 1) * maxBlocksPerSeq + blockFirst];
                     stage2.turboquantBits = mTurboquantBits;
+                    stage2.nKBlocks = static_cast<int>(kBlockList.size());
+                    stage2.nVBlocks = static_cast<int>(vBlockList.size());
                 }
 
                 static std::atomic<bool> sB22Logged{false};
@@ -1232,14 +1236,14 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             bool exp2 = false;
             if (sRtFired.compare_exchange_strong(exp2, true))
             {
-                std::size_t const rtBytes = static_cast<std::size_t>(kBlockList.size()) * stage2.slotInnerBytes;
+                std::size_t const rtBytes = static_cast<std::size_t>(stage2.nKBlocks) * stage2.slotInnerBytes;
                 void* rtK = nullptr;
                 if (cudaMalloc(&rtK, rtBytes) == cudaSuccess)
                 {
                     tq_kv_dequantize_paged_trtllm_layered(stage2.poolBaseShifted, mPhysBlocksK,
                         gQuantState.signs, gQuantStateK.active ? gQuantStateK.centroids : gQuantState.centroids,
                         rtK, stage2.turboquantBits, kDtypeFP16,
-                        static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlock_s2,
+                        stage2.nKBlocks, nKvHeadsL, dHeadL, kTokensPerBlock_s2,
                         /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
                         /*k_or_v=*/0, stage2.slotInnerBytes, stream);
                     cudaStreamSynchronize(stream);
