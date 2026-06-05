@@ -299,19 +299,39 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         return -1;
     }
 
-    int err = tq_kv_quantize_streaming(inputs[0], gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
-        mWorkspace.packed, mWorkspace.norms, mTurboquantBits, kDtypeFP16, nTokens, nTotalHeads, kDHead, stream);
-    if (err != 0)
+    // TQ_DISABLE_K1K2=1 skips the K1+K2 streaming round-trip and copies
+    // inputs[0] straight to mWorkspace.kv_out. Useful for isolating
+    // K3+K6 quality (stage 2): with K1+K2 disabled and stage 9b enabled,
+    // K experiences ONE quantization round-trip (K3+K6 on post-RoPE K)
+    // instead of TWO (K1+K2 pre-RoPE plus K3+K6 post-RoPE).
+    static bool const sDisableK1K2 = []() {
+        char const* v = std::getenv("TQ_DISABLE_K1K2");
+        bool d = (v != nullptr && v[0] == '1');
+        if (d) TLLM_LOG_INFO("[B.2.2 stage 3] TQ_DISABLE_K1K2=1 (K1+K2 streaming round-trip skipped, raw inputs[0] passed through)");
+        return d;
+    }();
+    if (sDisableK1K2)
     {
-        TLLM_LOG_ERROR("TurboquantAttentionPlugin: tq_kv_quantize_streaming returned %d", err);
-        return -1;
+        // Just copy inputs[0] -> mWorkspace.kv_out unchanged.
+        std::size_t bytes = static_cast<std::size_t>(nTokens) * nTotalHeads * kDHead * sizeof(std::uint16_t);
+        cudaMemcpyAsync(mWorkspace.kv_out, inputs[0], bytes, cudaMemcpyDeviceToDevice, stream);
     }
-    err = tq_kv_dequantize_streaming(mWorkspace.packed, mWorkspace.norms, gQuantState.signs, gQuantState.centroids,
-        mWorkspace.kv_out, mTurboquantBits, kDtypeFP16, nTokens, nTotalHeads, kDHead, stream);
-    if (err != 0)
+    else
     {
-        TLLM_LOG_ERROR("TurboquantAttentionPlugin: tq_kv_dequantize_streaming returned %d", err);
-        return -1;
+        int err = tq_kv_quantize_streaming(inputs[0], gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
+            mWorkspace.packed, mWorkspace.norms, mTurboquantBits, kDtypeFP16, nTokens, nTotalHeads, kDHead, stream);
+        if (err != 0)
+        {
+            TLLM_LOG_ERROR("TurboquantAttentionPlugin: tq_kv_quantize_streaming returned %d", err);
+            return -1;
+        }
+        err = tq_kv_dequantize_streaming(mWorkspace.packed, mWorkspace.norms, gQuantState.signs, gQuantState.centroids,
+            mWorkspace.kv_out, mTurboquantBits, kDtypeFP16, nTokens, nTotalHeads, kDHead, stream);
+        if (err != 0)
+        {
+            TLLM_LOG_ERROR("TurboquantAttentionPlugin: tq_kv_dequantize_streaming returned %d", err);
+            return -1;
+        }
     }
 
     static std::atomic<bool> sLogged{false};
