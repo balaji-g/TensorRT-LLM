@@ -404,6 +404,56 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         }
     }
 
+    // TQ_QUANT_Q=1 (stage 4 fix candidate (i)): apply an extra K1+K2
+    // round-trip to Q's slice of mWorkspace.kv_out. Closes the Q-K
+    // asymmetric-error gap that stage 2 opens: after this, Q has 2x
+    // K1+K2 round-trip error per layer (matching K-history's 1x
+    // K1+K2 + 1x K3+K6 ~= 2x). If the Q.K asymmetric-error
+    // hypothesis is right, stage 2 with this switch on should
+    // produce coherent text near baseline.
+    static bool const sQuantQ = []() {
+        char const* v = std::getenv("TQ_QUANT_Q");
+        bool q = (v != nullptr && v[0] == '1');
+        if (q) TLLM_LOG_INFO("[B.2.2 stage 4] TQ_QUANT_Q=1 (extra K1+K2 on Q slice to match K-history error level)");
+        return q;
+    }();
+    if (sQuantQ)
+    {
+        int const nQHeads = this->mNumHeads;
+        std::size_t const qBytes
+            = static_cast<std::size_t>(nTokens) * nQHeads * kDHead * sizeof(std::uint16_t);
+        std::size_t const tokenStrideKvOut
+            = static_cast<std::size_t>(nTotalHeads) * kDHead * sizeof(std::uint16_t);
+        std::size_t const tokenStrideQ
+            = static_cast<std::size_t>(nQHeads) * kDHead * sizeof(std::uint16_t);
+        void* qContig = nullptr;
+        if (cudaMalloc(&qContig, qBytes) == cudaSuccess)
+        {
+            // Gather Q slice: per-token first nQHeads*dHead*2 bytes.
+            cudaMemcpy2DAsync(qContig, tokenStrideQ, mWorkspace.kv_out, tokenStrideKvOut,
+                tokenStrideQ, nTokens, cudaMemcpyDeviceToDevice, stream);
+            // Round-trip via streaming K1+K2 in place.
+            tq_kv_quantize_streaming(qContig, gQuantState.signs, gQuantState.centroids,
+                gQuantState.thresholds, mWorkspace.packed, mWorkspace.norms, mTurboquantBits,
+                kDtypeFP16, nTokens, nQHeads, kDHead, stream);
+            tq_kv_dequantize_streaming(mWorkspace.packed, mWorkspace.norms, gQuantState.signs,
+                gQuantState.centroids, qContig, mTurboquantBits, kDtypeFP16, nTokens, nQHeads,
+                kDHead, stream);
+            // Scatter back into mWorkspace.kv_out's Q region.
+            cudaMemcpy2DAsync(mWorkspace.kv_out, tokenStrideKvOut, qContig, tokenStrideQ,
+                tokenStrideQ, nTokens, cudaMemcpyDeviceToDevice, stream);
+            // Diagnostic-grade: sync free. Promote to member buffer if
+            // we keep this in production.
+            cudaStreamSynchronize(stream);
+            cudaFree(qContig);
+        }
+        else
+        {
+            TLLM_LOG_WARNING("[B.2.2 stage 4] TQ_QUANT_Q cudaMalloc(%zu) failed; skipping Q re-quantization",
+                qBytes);
+        }
+    }
+
     static std::atomic<bool> sLogged{false};
     bool expected = false;
     if (sLogged.compare_exchange_strong(expected, true))
