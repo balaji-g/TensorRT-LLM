@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
@@ -126,6 +127,75 @@ struct DeviceQuantState
 };
 
 DeviceQuantState gQuantState;
+
+// Optional separate K-side quantizer state, loaded from a binary file
+// pointed to by env TQ_K_CODEBOOK_PATH. File layout:
+//   [n_levels * float32 centroids][(n_levels - 1) * float32 thresholds]
+// where n_levels = 256 for bits=8, 16 for bits=4. Shares the same signs
+// as gQuantState (signs are random ±1; only the codebook differs).
+// Loaded lazily on first stage-2 enqueue when env is set; falls back
+// to gQuantState's centroids/thresholds when env is unset or load
+// fails. Used for K3+K6 of K only (V keeps gQuantState).
+struct DeviceQuantStateExt
+{
+    int8_t* signs{nullptr};       // shared with gQuantState (alias)
+    float* centroids{nullptr};
+    float* thresholds{nullptr};
+    int bits{0};
+    bool active{false};
+    bool init_attempted{false};
+
+    bool initOnce(int b, int8_t* sharedSigns)
+    {
+        if (init_attempted)
+            return active;
+        init_attempted = true;
+        char const* path = std::getenv("TQ_K_CODEBOOK_PATH");
+        if (path == nullptr)
+        {
+            TLLM_LOG_INFO("[B.2.2 stage 3] TQ_K_CODEBOOK_PATH unset -- K uses baked-in codebook");
+            return false;
+        }
+        int const nLevels = 1 << b;
+        int const nThresholds = nLevels - 1;
+        std::size_t const expectedBytes
+            = static_cast<std::size_t>(nLevels + nThresholds) * sizeof(float);
+        FILE* fp = std::fopen(path, "rb");
+        if (fp == nullptr)
+        {
+            TLLM_LOG_WARNING("[B.2.2 stage 3] TQ_K_CODEBOOK_PATH=%s could not be opened", path);
+            return false;
+        }
+        std::vector<float> hostCentroids(nLevels), hostThresholds(nThresholds);
+        std::size_t readC = std::fread(hostCentroids.data(), sizeof(float), nLevels, fp);
+        std::size_t readT = std::fread(hostThresholds.data(), sizeof(float), nThresholds, fp);
+        std::fclose(fp);
+        if (readC != static_cast<std::size_t>(nLevels) || readT != static_cast<std::size_t>(nThresholds))
+        {
+            TLLM_LOG_WARNING("[B.2.2 stage 3] TQ_K_CODEBOOK_PATH=%s short read: got %zu centroids + %zu thresholds, "
+                             "expected %d + %d (%zu bytes)",
+                path, readC, readT, nLevels, nThresholds, expectedBytes);
+            return false;
+        }
+        if (cudaMalloc(&centroids, nLevels * sizeof(float)) != cudaSuccess
+            || cudaMalloc(&thresholds, nThresholds * sizeof(float)) != cudaSuccess)
+        {
+            TLLM_LOG_ERROR("[B.2.2 stage 3] alt K codebook cudaMalloc failed");
+            return false;
+        }
+        cudaMemcpy(centroids, hostCentroids.data(), nLevels * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(thresholds, hostThresholds.data(), nThresholds * sizeof(float), cudaMemcpyHostToDevice);
+        signs = sharedSigns;
+        bits = b;
+        active = true;
+        TLLM_LOG_INFO("[B.2.2 stage 3] alt K codebook loaded from %s "
+                      "(centroid range %+.4f .. %+.4f)",
+            path, hostCentroids.front(), hostCentroids.back());
+        return true;
+    }
+};
+
+DeviceQuantStateExt gQuantStateK;
 
 } // namespace
 
@@ -825,6 +895,14 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             void* const poolBaseShifted
                 = static_cast<std::uint8_t*>(poolBase) + layerStrideBytes;
 
+            // Lazily init the optional K-side codebook from
+            // TQ_K_CODEBOOK_PATH. If active, use it for K's K3+K6
+            // (V stays on the baked-in gQuantState since V is RoPE-
+            // free and the baked codebook works for K1+K2 of V).
+            gQuantStateK.initOnce(mTurboquantBits, gQuantState.signs);
+            float const* kCentroids = gQuantStateK.active ? gQuantStateK.centroids : gQuantState.centroids;
+            float const* kThresholds = gQuantStateK.active ? gQuantStateK.thresholds : gQuantState.thresholds;
+
             // K6 dequant active K and V slots from the real pool into
             // contiguous scratch_k6 buffers. For the very first enqueue
             // the real pool is uninitialized; we accept K6's output as
@@ -833,7 +911,7 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
             // From T=1 onward, post-enqueue K3 (below) keeps the real
             // pool populated with parent's RoPE-applied K and V.
             int rcK6 = tq_kv_dequantize_paged_trtllm_layered(poolBaseShifted, mPhysBlocksK,
-                gQuantState.signs, gQuantState.centroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
+                gQuantState.signs, kCentroids, mScratchK6K, mTurboquantBits, kDtypeFP16,
                 static_cast<int>(kBlockList.size()), nKvHeadsL, dHeadL, kTokensPerBlockB22,
                 /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
                 /*k_or_v=*/0, slotInnerBytes, stream);
@@ -1058,8 +1136,11 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         int rcK3K = 0;
         if (!sSkipK)
         {
+            // K uses the alt codebook from TQ_K_CODEBOOK_PATH if loaded.
+            float const* kCentroidsPost = gQuantStateK.active ? gQuantStateK.centroids : gQuantState.centroids;
+            float const* kThresholdsPost = gQuantStateK.active ? gQuantStateK.thresholds : gQuantState.thresholds;
             rcK3K = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK,
-                stage2.poolBaseShifted, gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
+                stage2.poolBaseShifted, gQuantState.signs, kCentroidsPost, kThresholdsPost,
                 stage2.turboquantBits, kDtypeFP16, nTokens, nKvHeadsL, dHeadL, kTokensPerBlock_s2,
                 /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
                 /*k_or_v=*/0, stage2.slotInnerBytes, stream);
