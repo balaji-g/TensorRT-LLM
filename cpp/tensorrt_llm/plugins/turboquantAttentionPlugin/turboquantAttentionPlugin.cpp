@@ -979,20 +979,80 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
                 tokenBytes, nTokens, cudaMemcpyDeviceToDevice, stream);
         }
 
+        // Stage 3 bisect switches:
+        //   TQ_STAGE2_SKIP_K=1: skip post-enqueue K3 of K (leave K
+        //     stale in real pool). If output improves, K3-of-K is the
+        //     drift source.
+        //   TQ_STAGE2_SKIP_V=1: skip post-enqueue K3 of V.
+        //   TQ_STAGE2_DUMP=1: once-only host-side dump of mScratchPool
+        //     (post-parent-write) vs mKContig (post-gather) for layer
+        //     0 first enqueue, to verify gather lands the bytes we
+        //     think it does.
+        static bool const sSkipK = []() {
+            char const* v = std::getenv("TQ_STAGE2_SKIP_K");
+            bool s = (v != nullptr && v[0] == '1');
+            if (s) TLLM_LOG_INFO("[B.2.2 stage 3] TQ_STAGE2_SKIP_K=1 (post-enqueue K3 of K disabled)");
+            return s;
+        }();
+        static bool const sSkipV = []() {
+            char const* v = std::getenv("TQ_STAGE2_SKIP_V");
+            bool s = (v != nullptr && v[0] == '1');
+            if (s) TLLM_LOG_INFO("[B.2.2 stage 3] TQ_STAGE2_SKIP_V=1 (post-enqueue K3 of V disabled)");
+            return s;
+        }();
+        static bool const sDumpEnabled = []() {
+            char const* v = std::getenv("TQ_STAGE2_DUMP");
+            return v != nullptr && v[0] == '1';
+        }();
+        static std::atomic<bool> sDumpFired{false};
+        if (sDumpEnabled && this->mLayerIdx == 0)
+        {
+            bool expected = false;
+            if (sDumpFired.compare_exchange_strong(expected, true))
+            {
+                // Sync, then read 4 fp16 values per source.
+                cudaStreamSynchronize(stream);
+                std::uint16_t hScratchK[4] = {0}, hKContig[4] = {0};
+                std::uint16_t hScratchV[4] = {0}, hVContig[4] = {0};
+                cudaMemcpy(hScratchK, static_cast<std::uint8_t*>(mScratchPool) + kSlotBase + offBytesInRow,
+                    sizeof(hScratchK), cudaMemcpyDeviceToHost);
+                cudaMemcpy(hKContig, mKContig, sizeof(hKContig), cudaMemcpyDeviceToHost);
+                cudaMemcpy(hScratchV, static_cast<std::uint8_t*>(mScratchPool) + vSlotBase + offBytesInRow,
+                    sizeof(hScratchV), cudaMemcpyDeviceToHost);
+                cudaMemcpy(hVContig, mVContig, sizeof(hVContig), cudaMemcpyDeviceToHost);
+                TLLM_LOG_INFO(
+                    "[B.2.2 stage 3 dump] layer=0 first enqueue, head=0 token=0 first 4 fp16 (raw uint16): "
+                    "K scratchPool=[%04x %04x %04x %04x] mKContig=[%04x %04x %04x %04x] "
+                    "V scratchPool=[%04x %04x %04x %04x] mVContig=[%04x %04x %04x %04x]",
+                    hScratchK[0], hScratchK[1], hScratchK[2], hScratchK[3],
+                    hKContig[0], hKContig[1], hKContig[2], hKContig[3],
+                    hScratchV[0], hScratchV[1], hScratchV[2], hScratchV[3],
+                    hVContig[0], hVContig[1], hVContig[2], hVContig[3]);
+            }
+        }
+
         // K3 quantize gathered K / V into the persistent real pool
         // at the new-token slot positions. Same flat-slot addressing
         // as the pre-enqueue K6: n_layers_per_pool=1, kv_factor=1,
         // relative_layer=0, k_or_v=0; pool_base already shifted.
-        int rcK3K = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK,
-            stage2.poolBaseShifted, gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
-            stage2.turboquantBits, kDtypeFP16, nTokens, nKvHeadsL, dHeadL, kTokensPerBlock_s2,
-            /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-            /*k_or_v=*/0, stage2.slotInnerBytes, stream);
-        int rcK3V = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV,
-            stage2.poolBaseShifted, gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
-            stage2.turboquantBits, kDtypeFP16, nTokens, nKvHeadsL, dHeadL, kTokensPerBlock_s2,
-            /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
-            /*k_or_v=*/0, stage2.slotInnerBytes, stream);
+        int rcK3K = 0;
+        if (!sSkipK)
+        {
+            rcK3K = tq_kv_quantize_paged_trtllm_layered(mKContig, mSlotMappingK,
+                stage2.poolBaseShifted, gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
+                stage2.turboquantBits, kDtypeFP16, nTokens, nKvHeadsL, dHeadL, kTokensPerBlock_s2,
+                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                /*k_or_v=*/0, stage2.slotInnerBytes, stream);
+        }
+        int rcK3V = 0;
+        if (!sSkipV)
+        {
+            rcK3V = tq_kv_quantize_paged_trtllm_layered(mVContig, mSlotMappingV,
+                stage2.poolBaseShifted, gQuantState.signs, gQuantState.centroids, gQuantState.thresholds,
+                stage2.turboquantBits, kDtypeFP16, nTokens, nKvHeadsL, dHeadL, kTokensPerBlock_s2,
+                /*n_layers_per_pool=*/1, /*kv_factor=*/1, /*relative_layer=*/0,
+                /*k_or_v=*/0, stage2.slotInnerBytes, stream);
+        }
 
         static std::atomic<bool> sStage2Logged{false};
         bool expected = false;
