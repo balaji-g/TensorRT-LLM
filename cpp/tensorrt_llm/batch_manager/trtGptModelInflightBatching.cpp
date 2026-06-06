@@ -32,6 +32,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/turboquantKVCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 #include "tensorrt_llm/batch_manager/makeDecodingBatchInputOutput.h"
@@ -626,14 +627,44 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     }
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.enableBlockReuse : false;
 
-    auto kvCacheManager = std::make_shared<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec,
-        tempAttentionWindowInputs, kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
-        kvCacheConfig.onboardBlocks, kvCacheType, kvCacheConfig.secondaryOffloadMinPriority,
-        kvCacheConfig.eventBufferMaxSize > 0
-            ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.eventBufferMaxSize)
-            : nullptr,
-        false, kvCacheConfig.enablePartialReuse, kvCacheConfig.copyOnPartialReuse);
+    // M12.4 B.3b — TurboquantKVCacheManager pool shrink, activated via
+    // env TQ_SHRINK_POOL=<bits> (4 or 8). Must be paired with
+    // TQ_ENABLE_STEP9B=1 on the plugin so K3 writes packed bytes into
+    // the (now shrunk) slot. With both env vars set, the persistent KV
+    // pool is allocated at packed+norms size (~33 KB at bits=8 / ~17 KB
+    // at bits=4 per slot vs 65 KB fp16 on Llama-3-8B) — the actual HBM
+    // savings of the Turboquant integration.
+    std::shared_ptr<kv_cache_manager::KVCacheManager> kvCacheManager;
+    {
+        char const* tqShrink = std::getenv("TQ_SHRINK_POOL");
+        int tqBits = (tqShrink != nullptr) ? std::atoi(tqShrink) : 0;
+        if (tqBits == 4 || tqBits == 8)
+        {
+            TLLM_LOG_INFO("[M12.4 B.3b] TQ_SHRINK_POOL=%d active -- pool will be allocated at packed+norms size",
+                tqBits);
+            kvCacheManager = std::make_shared<kv_cache_manager::TurboquantKVCacheManager>(tqBits,
+                numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksInPrimaryPool, blocksInSecondaryPool,
+                getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs, kvDtype,
+                getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
+                kvCacheConfig.onboardBlocks, kvCacheType, kvCacheConfig.secondaryOffloadMinPriority,
+                kvCacheConfig.eventBufferMaxSize > 0
+                    ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.eventBufferMaxSize)
+                    : nullptr,
+                false, kvCacheConfig.enablePartialReuse, kvCacheConfig.copyOnPartialReuse);
+        }
+        else
+        {
+            kvCacheManager = std::make_shared<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
+                blocksInPrimaryPool, blocksInSecondaryPool, getMaxNumSequences(), getMaxBeamWidth(),
+                maxAttentionWindowVec, tempAttentionWindowInputs, kvDtype, getSinkTokenLen(),
+                mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse, kvCacheConfig.onboardBlocks, kvCacheType,
+                kvCacheConfig.secondaryOffloadMinPriority,
+                kvCacheConfig.eventBufferMaxSize > 0
+                    ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.eventBufferMaxSize)
+                    : nullptr,
+                false, kvCacheConfig.enablePartialReuse, kvCacheConfig.copyOnPartialReuse);
+        }
+    }
 
     reshapeKvTensors(kvCacheManager->getOffsetTableDimensions());
 
