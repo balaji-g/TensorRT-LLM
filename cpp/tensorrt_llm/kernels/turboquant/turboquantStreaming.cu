@@ -360,6 +360,187 @@ __global__ void kv_dequantize_per_head_kernel(
     }
 }
 
+// =====================================================================
+// M12.4 Phase 3a — bits=12 streaming variants. 12 bits doesn't pack
+// into a byte cleanly, so we group 2 consecutive coords into 3 bytes
+// (24 bits aligned). Codebook is 4096 entries; encode uses binary
+// search (~12 comparisons) since 4095-element linear scan would be
+// expensive. d_head must be even.
+// =====================================================================
+
+__device__ __forceinline__ uint16_t encode_index_b12(float v, const float* __restrict__ thresh)
+{
+    // Binary search: find the smallest i with thresh[i] >= v (i.e., the
+    // number of thresholds strictly less than v). Result ∈ [0, 4095].
+    int lo = 0, hi = 4095;
+    while (lo < hi)
+    {
+        int mid = (lo + hi) >> 1;
+        if (v > thresh[mid]) lo = mid + 1;
+        else                 hi = mid;
+    }
+    return static_cast<uint16_t>(lo);
+}
+
+template <typename T>
+__global__ void kv_quantize_per_head_kernel_b12(
+    const T*       __restrict__ kv,
+    const int8_t*  __restrict__ rotation_signs,
+    const float*   __restrict__ /*centroids — unused on encode*/,
+    const float*   __restrict__ thresholds,
+    uint8_t*       __restrict__ packed_out,
+    float*         __restrict__ norms_out,
+    int            n_heads,
+    int            d_head)
+{
+    int token = blockIdx.x;
+    int head  = blockIdx.y;
+    int tid   = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float* head_data = smem;
+    float* reduce_buf = smem + d_head;
+
+    const T* head_in = kv + ((size_t)token * n_heads + head) * d_head;
+    // packed_bytes_per_head = d_head * 12 / 8 = d_head + d_head/2 = 1.5*d_head
+    int const packed_bytes_per_head = d_head + (d_head >> 1);
+    uint8_t* head_out = packed_out + ((size_t)token * n_heads + head) * packed_bytes_per_head;
+
+    // Read + sum-of-squares.
+    float local_ss = 0.0f;
+    for (int i = tid; i < d_head; i += blockDim.x)
+    {
+        float v = widen_to_float<T>(head_in[i]);
+        head_data[i] = v;
+        local_ss += v * v;
+    }
+    reduce_buf[tid] = local_ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+        __syncthreads();
+    }
+    float norm = sqrtf(reduce_buf[0]);
+
+    if (norm == 0.0f)
+    {
+        for (int b = tid; b < packed_bytes_per_head; b += blockDim.x) head_out[b] = 0;
+        if (tid == 0) norms_out[(size_t)token * n_heads + head] = 0.0f;
+        return;
+    }
+
+    // Normalize + signs.
+    for (int i = tid; i < d_head; i += blockDim.x)
+    {
+        head_data[i] = (head_data[i] / norm) * (float)rotation_signs[i];
+    }
+    __syncthreads();
+
+    // Hadamard butterfly (in-place, unnormalised).
+    for (int step = 1; step < d_head; step <<= 1)
+    {
+        for (int p = tid; p < d_head / 2; p += blockDim.x)
+        {
+            int group = p / step;
+            int off   = p % step;
+            int i     = group * step * 2 + off;
+            int j     = i + step;
+            float a = head_data[i];
+            float b = head_data[j];
+            head_data[i] = a + b;
+            head_data[j] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Encode + pack 2 coords into 3 bytes.
+    int const n_pairs = d_head >> 1;
+    for (int pair = tid; pair < n_pairs; pair += blockDim.x)
+    {
+        int c0 = pair << 1;
+        int c1 = c0 + 1;
+        uint16_t i0 = encode_index_b12(head_data[c0], thresholds);
+        uint16_t i1 = encode_index_b12(head_data[c1], thresholds);
+        int byte_off = pair * 3;
+        head_out[byte_off + 0] = static_cast<uint8_t>(i0 & 0xFF);
+        head_out[byte_off + 1] = static_cast<uint8_t>(((i0 >> 8) & 0x0F) | ((i1 & 0x0F) << 4));
+        head_out[byte_off + 2] = static_cast<uint8_t>((i1 >> 4) & 0xFF);
+    }
+
+    if (tid == 0) norms_out[(size_t)token * n_heads + head] = norm;
+}
+
+template <typename T>
+__global__ void kv_dequantize_per_head_kernel_b12(
+    const uint8_t* __restrict__ packed,
+    const float*   __restrict__ norms,
+    const int8_t*  __restrict__ rotation_signs,
+    const float*   __restrict__ centroids,
+    T*             __restrict__ kv_out,
+    int            n_heads,
+    int            d_head)
+{
+    int token = blockIdx.x;
+    int head  = blockIdx.y;
+    int tid   = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float* head_data = smem;
+
+    int const packed_bytes_per_head = d_head + (d_head >> 1);
+    const uint8_t* head_in = packed + ((size_t)token * n_heads + head) * packed_bytes_per_head;
+    T* head_out = kv_out + ((size_t)token * n_heads + head) * d_head;
+    float head_norm = norms[(size_t)token * n_heads + head];
+
+    if (head_norm == 0.0f)
+    {
+        for (int i = tid; i < d_head; i += blockDim.x) head_out[i] = narrow_from_float<T>(0.0f);
+        return;
+    }
+
+    // Decode pairs.
+    int const n_pairs = d_head >> 1;
+    for (int pair = tid; pair < n_pairs; pair += blockDim.x)
+    {
+        int byte_off = pair * 3;
+        uint8_t b0 = head_in[byte_off + 0];
+        uint8_t b1 = head_in[byte_off + 1];
+        uint8_t b2 = head_in[byte_off + 2];
+        uint16_t i0 = static_cast<uint16_t>(b0) | (static_cast<uint16_t>(b1 & 0x0F) << 8);
+        uint16_t i1 = static_cast<uint16_t>((b1 >> 4) & 0x0F) | (static_cast<uint16_t>(b2) << 4);
+        int c0 = pair << 1;
+        int c1 = c0 + 1;
+        head_data[c0] = centroids[i0];
+        head_data[c1] = centroids[i1];
+    }
+    __syncthreads();
+
+    // Inverse Hadamard.
+    for (int step = 1; step < d_head; step <<= 1)
+    {
+        for (int p = tid; p < d_head / 2; p += blockDim.x)
+        {
+            int group = p / step;
+            int off   = p % step;
+            int i     = group * step * 2 + off;
+            int j     = i + step;
+            float a = head_data[i];
+            float b = head_data[j];
+            head_data[i] = a + b;
+            head_data[j] = a - b;
+        }
+        __syncthreads();
+    }
+
+    float inv_d = 1.0f / (float)d_head;
+    for (int i = tid; i < d_head; i += blockDim.x)
+    {
+        float v = head_data[i] * inv_d * (float)rotation_signs[i] * head_norm;
+        head_out[i] = narrow_from_float<T>(v);
+    }
+}
+
 // Launch dispatch macros: one BITS × dtype combination expands per
 // macro invocation. Keeps the if/switch ladder readable and ensures
 // the only thing varying between fp16 and bf16 paths is the
@@ -370,6 +551,22 @@ __global__ void kv_dequantize_per_head_kernel(
         d_rotation_signs, d_centroids, d_thresholds,                           \
         static_cast<uint8_t*>(const_cast<void*>(d_packed)),                    \
         static_cast<float*>(const_cast<void*>(d_norms)),                       \
+        n_heads, d_head)
+
+#define TQ_LAUNCH_QUANTIZE_B12(T)                                                  \
+    kv_quantize_per_head_kernel_b12<T><<<grid, threads, smem, stream>>>(           \
+        static_cast<const T*>(d_kv),                                               \
+        d_rotation_signs, d_centroids, d_thresholds,                               \
+        static_cast<uint8_t*>(const_cast<void*>(d_packed)),                        \
+        static_cast<float*>(const_cast<void*>(d_norms)),                           \
+        n_heads, d_head)
+
+#define TQ_LAUNCH_DEQUANTIZE_B12(T)                                                \
+    kv_dequantize_per_head_kernel_b12<T><<<grid, threads, smem, stream>>>(         \
+        static_cast<const uint8_t*>(d_packed),                                     \
+        static_cast<const float*>(d_norms),                                        \
+        d_rotation_signs, d_centroids,                                             \
+        static_cast<T*>(d_out_kv_or_packed),                                       \
         n_heads, d_head)
 
 #define TQ_LAUNCH_DEQUANTIZE(BITS_VAL, T)                                      \
@@ -416,12 +613,14 @@ cudaError_t launch_kv_streaming(
             switch (bits) {
                 case 8: TQ_LAUNCH_QUANTIZE(8, __half); break;
                 case 4: TQ_LAUNCH_QUANTIZE(4, __half); break;
+                case 12: TQ_LAUNCH_QUANTIZE_B12(__half); break;
                 default: return cudaErrorInvalidValue;
             }
         } else {  // TQ_DTYPE_BF16
             switch (bits) {
                 case 8: TQ_LAUNCH_QUANTIZE(8, __nv_bfloat16); break;
                 case 4: TQ_LAUNCH_QUANTIZE(4, __nv_bfloat16); break;
+                case 12: TQ_LAUNCH_QUANTIZE_B12(__nv_bfloat16); break;
                 default: return cudaErrorInvalidValue;
             }
         }
@@ -430,12 +629,14 @@ cudaError_t launch_kv_streaming(
             switch (bits) {
                 case 8: TQ_LAUNCH_DEQUANTIZE(8, __half); break;
                 case 4: TQ_LAUNCH_DEQUANTIZE(4, __half); break;
+                case 12: TQ_LAUNCH_DEQUANTIZE_B12(__half); break;
                 default: return cudaErrorInvalidValue;
             }
         } else {  // TQ_DTYPE_BF16
             switch (bits) {
                 case 8: TQ_LAUNCH_DEQUANTIZE(8, __nv_bfloat16); break;
                 case 4: TQ_LAUNCH_DEQUANTIZE(4, __nv_bfloat16); break;
+                case 12: TQ_LAUNCH_DEQUANTIZE_B12(__nv_bfloat16); break;
                 default: return cudaErrorInvalidValue;
             }
         }
@@ -445,6 +646,194 @@ cudaError_t launch_kv_streaming(
 
 #undef TQ_LAUNCH_QUANTIZE
 #undef TQ_LAUNCH_DEQUANTIZE
+#undef TQ_LAUNCH_QUANTIZE_B12
+#undef TQ_LAUNCH_DEQUANTIZE_B12
+
+// =====================================================================
+// Paged variants for bits=12 (K3/K6 hot path). Same per-pair packing
+// as the streaming bits=12 kernels above; output addressing uses
+// caller-supplied strides (`packed_block_stride`, `packed_head_stride`,
+// `packed_slot_stride`). For bits=12, packed_slot_stride = (d_head * 3
+// / 2) — the launcher passes packed_bytes_per_head = d_head * 12 / 8
+// which equals 1.5*d_head automatically.
+// =====================================================================
+
+template <typename T>
+__global__ void paged_quantize_per_head_kernel_b12(
+    const T*       __restrict__ kv,
+    const int32_t* __restrict__ slot_mapping,
+    const int8_t*  __restrict__ rotation_signs,
+    const float*   __restrict__ /*centroids*/,
+    const float*   __restrict__ thresholds,
+    uint8_t*       __restrict__ packed_cache,
+    float*         __restrict__ norms_cache,
+    int            n_kv_heads,
+    int            d_head,
+    int            block_size,
+    int            packed_block_stride,
+    int            packed_head_stride,
+    int            packed_slot_stride,
+    int            norms_block_stride,
+    int            norms_head_stride,
+    int            norms_slot_stride)
+{
+    int token = blockIdx.x;
+    int head  = blockIdx.y;
+    int tid   = threadIdx.x;
+
+    int32_t slot = slot_mapping[token];
+    if (slot < 0) return;
+    int block_idx       = slot / block_size;
+    int offset_in_block = slot - block_idx * block_size;
+
+    extern __shared__ float smem[];
+    float* head_data  = smem;
+    float* reduce_buf = smem + d_head;
+
+    const T* head_in = kv + ((size_t)token * n_kv_heads + head) * d_head;
+    uint8_t* packed_out = packed_cache
+        + (size_t)block_idx       * (size_t)packed_block_stride
+        + (size_t)head            * (size_t)packed_head_stride
+        + (size_t)offset_in_block * (size_t)packed_slot_stride;
+    float* norm_out = norms_cache
+        + (size_t)block_idx       * (size_t)norms_block_stride
+        + (size_t)head            * (size_t)norms_head_stride
+        + (size_t)offset_in_block * (size_t)norms_slot_stride;
+
+    float local_ss = 0.0f;
+    for (int i = tid; i < d_head; i += blockDim.x)
+    {
+        float v = widen_to_float<T>(head_in[i]);
+        head_data[i] = v;
+        local_ss += v * v;
+    }
+    reduce_buf[tid] = local_ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+        __syncthreads();
+    }
+    float norm = sqrtf(reduce_buf[0]);
+    if (norm == 0.0f)
+    {
+        int const packed_bytes_per_head = d_head + (d_head >> 1);
+        for (int b = tid; b < packed_bytes_per_head; b += blockDim.x) packed_out[b] = 0;
+        if (tid == 0) *norm_out = 0.0f;
+        return;
+    }
+    for (int i = tid; i < d_head; i += blockDim.x)
+    {
+        head_data[i] = (head_data[i] / norm) * (float)rotation_signs[i];
+    }
+    __syncthreads();
+    for (int step = 1; step < d_head; step <<= 1)
+    {
+        for (int p = tid; p < d_head / 2; p += blockDim.x)
+        {
+            int group = p / step, off = p % step;
+            int i = group * step * 2 + off, j = i + step;
+            float a = head_data[i], b = head_data[j];
+            head_data[i] = a + b;
+            head_data[j] = a - b;
+        }
+        __syncthreads();
+    }
+    int const n_pairs = d_head >> 1;
+    for (int pair = tid; pair < n_pairs; pair += blockDim.x)
+    {
+        int c0 = pair << 1, c1 = c0 + 1;
+        uint16_t i0 = encode_index_b12(head_data[c0], thresholds);
+        uint16_t i1 = encode_index_b12(head_data[c1], thresholds);
+        int byte_off = pair * 3;
+        packed_out[byte_off + 0] = static_cast<uint8_t>(i0 & 0xFF);
+        packed_out[byte_off + 1] = static_cast<uint8_t>(((i0 >> 8) & 0x0F) | ((i1 & 0x0F) << 4));
+        packed_out[byte_off + 2] = static_cast<uint8_t>((i1 >> 4) & 0xFF);
+    }
+    if (tid == 0) *norm_out = norm;
+}
+
+template <typename T>
+__global__ void paged_dequantize_per_token_kernel_b12(
+    const uint8_t* __restrict__ packed_cache,
+    const float*   __restrict__ norms_cache,
+    const int32_t* __restrict__ physical_block_ids,
+    const int8_t*  __restrict__ rotation_signs,
+    const float*   __restrict__ centroids,
+    T*             __restrict__ scratch_out,
+    int            n_kv_heads,
+    int            d_head,
+    int            block_size,
+    int            packed_block_stride,
+    int            packed_kv_head_stride,
+    int            packed_slot_stride,
+    int            norms_block_stride,
+    int            norms_kv_head_stride,
+    int            norms_slot_stride)
+{
+    int scratch_token_idx = blockIdx.x;
+    int kv_head           = blockIdx.y;
+    int tid               = threadIdx.x;
+    int scratch_block_idx = scratch_token_idx / block_size;
+    int slot              = scratch_token_idx - scratch_block_idx * block_size;
+    int phys_block        = physical_block_ids[scratch_block_idx];
+
+    const uint8_t* packed_head = packed_cache
+        + (size_t)phys_block * (size_t)packed_block_stride
+        + (size_t)kv_head    * (size_t)packed_kv_head_stride
+        + (size_t)slot       * (size_t)packed_slot_stride;
+    float head_norm = norms_cache[
+        (size_t)phys_block * (size_t)norms_block_stride
+      + (size_t)kv_head    * (size_t)norms_kv_head_stride
+      + (size_t)slot       * (size_t)norms_slot_stride];
+
+    T* out = scratch_out
+        + (((size_t)scratch_block_idx * n_kv_heads + kv_head) * block_size + slot) * d_head;
+
+    extern __shared__ float smem[];
+    float* head_data = smem;
+
+    if (head_norm == 0.0f)
+    {
+        for (int i = tid; i < d_head; i += blockDim.x) out[i] = narrow_from_float<T>(0.0f);
+        return;
+    }
+
+    int const n_pairs = d_head >> 1;
+    for (int pair = tid; pair < n_pairs; pair += blockDim.x)
+    {
+        int byte_off = pair * 3;
+        uint8_t b0 = packed_head[byte_off + 0];
+        uint8_t b1 = packed_head[byte_off + 1];
+        uint8_t b2 = packed_head[byte_off + 2];
+        uint16_t i0 = static_cast<uint16_t>(b0) | (static_cast<uint16_t>(b1 & 0x0F) << 8);
+        uint16_t i1 = static_cast<uint16_t>((b1 >> 4) & 0x0F) | (static_cast<uint16_t>(b2) << 4);
+        int c0 = pair << 1, c1 = c0 + 1;
+        head_data[c0] = centroids[i0];
+        head_data[c1] = centroids[i1];
+    }
+    __syncthreads();
+
+    for (int step = 1; step < d_head; step <<= 1)
+    {
+        for (int p = tid; p < d_head / 2; p += blockDim.x)
+        {
+            int group = p / step, off = p - group * step;
+            int i = group * step * 2 + off, j = i + step;
+            float a = head_data[i], b = head_data[j];
+            head_data[i] = a + b;
+            head_data[j] = a - b;
+        }
+        __syncthreads();
+    }
+
+    float inv_d = 1.0f / (float)d_head;
+    for (int i = tid; i < d_head; i += blockDim.x)
+    {
+        float v = head_data[i] * inv_d * (float)rotation_signs[i] * head_norm;
+        out[i] = narrow_from_float<T>(v);
+    }
+}
 
 // =====================================================================
 // K3 — paged write kernel (docs/KERNELS.md §3.3).
@@ -637,7 +1026,7 @@ cudaError_t launch_paged_quantize(
     if (n_tokens <= 0 || n_kv_heads <= 0 || n_blocks <= 0 || block_size <= 0) {
         return cudaErrorInvalidValue;
     }
-    if (bits != 4 && bits != 8) {
+    if (bits != 4 && bits != 8 && bits != 12) {
         return cudaErrorInvalidValue;
     }
 
@@ -855,7 +1244,7 @@ cudaError_t launch_paged_dequantize(
     if (dtype != TQ_DTYPE_FP16 && dtype != TQ_DTYPE_BF16) {
         return cudaErrorInvalidValue;
     }
-    if (bits != 4 && bits != 8) {
+    if (bits != 4 && bits != 8 && bits != 12) {
         return cudaErrorInvalidValue;
     }
     if (n_scratch_blocks <= 0 || n_kv_heads <= 0 || block_size <= 0) {
@@ -965,7 +1354,7 @@ extern "C" int tq_kv_quantize_paged_trtllm_layered(
 ) {
     if ((d_head & (d_head - 1)) != 0 || d_head <= 0 || d_head > 1024) return cudaErrorInvalidValue;
     if (dtype != TQ_DTYPE_FP16 && dtype != TQ_DTYPE_BF16) return cudaErrorInvalidValue;
-    if (bits != 4 && bits != 8) return cudaErrorInvalidValue;
+    if (bits != 4 && bits != 8 && bits != 12) return cudaErrorInvalidValue;
     if (n_tokens <= 0 || n_kv_heads <= 0 || tokens_per_block <= 0) return cudaErrorInvalidValue;
     if (n_layers_per_pool <= 0 || kv_factor <= 0) return cudaErrorInvalidValue;
     if (relative_layer < 0 || relative_layer >= n_layers_per_pool) return cudaErrorInvalidValue;
@@ -1006,8 +1395,14 @@ extern "C" int tq_kv_quantize_paged_trtllm_layered(
                 layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
                 packed_block_stride, packed_head_stride, packed_slot_stride,
                 norms_block_stride, norms_head_stride, norms_slot_stride);
-        else // bits == 4
+        else if (bits == 4)
             paged_quantize_per_head_kernel<4, __half><<<grid, threads, smem, stream>>>(
+                static_cast<__half const*>(d_kv), d_slot_mapping, d_signs, d_centroids, d_thresholds,
+                layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_head_stride, packed_slot_stride,
+                norms_block_stride, norms_head_stride, norms_slot_stride);
+        else // bits == 12
+            paged_quantize_per_head_kernel_b12<__half><<<grid, threads, smem, stream>>>(
                 static_cast<__half const*>(d_kv), d_slot_mapping, d_signs, d_centroids, d_thresholds,
                 layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
                 packed_block_stride, packed_head_stride, packed_slot_stride,
@@ -1021,8 +1416,14 @@ extern "C" int tq_kv_quantize_paged_trtllm_layered(
                 layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
                 packed_block_stride, packed_head_stride, packed_slot_stride,
                 norms_block_stride, norms_head_stride, norms_slot_stride);
-        else
+        else if (bits == 4)
             paged_quantize_per_head_kernel<4, __nv_bfloat16><<<grid, threads, smem, stream>>>(
+                static_cast<__nv_bfloat16 const*>(d_kv), d_slot_mapping, d_signs, d_centroids, d_thresholds,
+                layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_head_stride, packed_slot_stride,
+                norms_block_stride, norms_head_stride, norms_slot_stride);
+        else // bits == 12
+            paged_quantize_per_head_kernel_b12<__nv_bfloat16><<<grid, threads, smem, stream>>>(
                 static_cast<__nv_bfloat16 const*>(d_kv), d_slot_mapping, d_signs, d_centroids, d_thresholds,
                 layer_k_or_v_packed, layer_k_or_v_norms, n_kv_heads, d_head, tokens_per_block,
                 packed_block_stride, packed_head_stride, packed_slot_stride,
@@ -1052,7 +1453,7 @@ extern "C" int tq_kv_dequantize_paged_trtllm_layered(
 ) {
     if ((d_head & (d_head - 1)) != 0 || d_head <= 0 || d_head > 1024) return cudaErrorInvalidValue;
     if (dtype != TQ_DTYPE_FP16 && dtype != TQ_DTYPE_BF16) return cudaErrorInvalidValue;
-    if (bits != 4 && bits != 8) return cudaErrorInvalidValue;
+    if (bits != 4 && bits != 8 && bits != 12) return cudaErrorInvalidValue;
     if (n_scratch_blocks <= 0 || n_kv_heads <= 0 || tokens_per_block <= 0) return cudaErrorInvalidValue;
 
     int const packed_bytes_per_head  = d_head * bits / 8;
@@ -1091,8 +1492,14 @@ extern "C" int tq_kv_dequantize_paged_trtllm_layered(
                 static_cast<__half*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
                 packed_block_stride, packed_kv_head_stride, packed_slot_stride,
                 norms_block_stride, norms_kv_head_stride, norms_slot_stride);
-        else
+        else if (bits == 4)
             paged_dequantize_per_token_kernel<4, __half><<<grid, threads, smem, stream>>>(
+                layer_k_or_v_packed, layer_k_or_v_norms, d_physical_block_ids, d_signs, d_centroids,
+                static_cast<__half*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_kv_head_stride, packed_slot_stride,
+                norms_block_stride, norms_kv_head_stride, norms_slot_stride);
+        else // bits == 12
+            paged_dequantize_per_token_kernel_b12<__half><<<grid, threads, smem, stream>>>(
                 layer_k_or_v_packed, layer_k_or_v_norms, d_physical_block_ids, d_signs, d_centroids,
                 static_cast<__half*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
                 packed_block_stride, packed_kv_head_stride, packed_slot_stride,
@@ -1106,8 +1513,14 @@ extern "C" int tq_kv_dequantize_paged_trtllm_layered(
                 static_cast<__nv_bfloat16*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
                 packed_block_stride, packed_kv_head_stride, packed_slot_stride,
                 norms_block_stride, norms_kv_head_stride, norms_slot_stride);
-        else
+        else if (bits == 4)
             paged_dequantize_per_token_kernel<4, __nv_bfloat16><<<grid, threads, smem, stream>>>(
+                layer_k_or_v_packed, layer_k_or_v_norms, d_physical_block_ids, d_signs, d_centroids,
+                static_cast<__nv_bfloat16*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
+                packed_block_stride, packed_kv_head_stride, packed_slot_stride,
+                norms_block_stride, norms_kv_head_stride, norms_slot_stride);
+        else // bits == 12
+            paged_dequantize_per_token_kernel_b12<__nv_bfloat16><<<grid, threads, smem, stream>>>(
                 layer_k_or_v_packed, layer_k_or_v_norms, d_physical_block_ids, d_signs, d_centroids,
                 static_cast<__nv_bfloat16*>(d_scratch_out), n_kv_heads, d_head, tokens_per_block,
                 packed_block_stride, packed_kv_head_stride, packed_slot_stride,
@@ -1612,7 +2025,7 @@ cudaError_t launch_paged_attention_decode(
     if (dtype != TQ_DTYPE_FP16 && dtype != TQ_DTYPE_BF16) {
         return cudaErrorInvalidValue;
     }
-    if (bits != 4 && bits != 8) {
+    if (bits != 4 && bits != 8 && bits != 12) {
         return cudaErrorInvalidValue;
     }
     if (n_seqs <= 0 || n_q_heads <= 0 || n_kv_heads <= 0 || n_blocks <= 0
@@ -1890,7 +2303,7 @@ cudaError_t launch_paged_attention_prefill(
     if (dtype != TQ_DTYPE_FP16 && dtype != TQ_DTYPE_BF16) {
         return cudaErrorInvalidValue;
     }
-    if (bits != 4 && bits != 8) {
+    if (bits != 4 && bits != 8 && bits != 12) {
         return cudaErrorInvalidValue;
     }
     if (q_len <= 0 || n_q_heads <= 0 || n_kv_heads <= 0 || n_blocks <= 0

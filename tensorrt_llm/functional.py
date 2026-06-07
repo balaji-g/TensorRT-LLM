@@ -5512,8 +5512,8 @@ def gpt_attention(
     ).plugin_config.turboquant_attention_plugin
     _turboquant_bits = default_net().plugin_config.turboquant_bits
     if _turboquant_attn_plugin:
-        assert _turboquant_bits in (4, 8), (
-            f"turboquant_attention_plugin requires turboquant_bits ∈ {{4, 8}}, "
+        assert _turboquant_bits in (4, 8, 12), (
+            f"turboquant_attention_plugin requires turboquant_bits ∈ {{4, 8, 12}}, "
             f"got {_turboquant_bits!r}")
         attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
             'TurboquantAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)

@@ -51,8 +51,8 @@ constexpr int kDtypeFP16 = 0; // matches tq_dtype::TQ_DTYPE_FP16
 
 void validateBits(int bits)
 {
-    TLLM_CHECK_WITH_INFO(bits == 4 || bits == 8,
-        "TurboquantAttentionPlugin: turboquantBits must be 4 or 8, got %d", bits);
+    TLLM_CHECK_WITH_INFO(bits == 4 || bits == 8 || bits == 12,
+        "TurboquantAttentionPlugin: turboquantBits must be 4, 8, or 12, got %d", bits);
 }
 
 // Device-resident quantizer state. Lazy initialized on first enqueue.
@@ -104,13 +104,23 @@ struct DeviceQuantState
             nCentroids = 256;
             nThresholds = 255;
         }
-        else
+        else if (b == 4)
         {
             hostSigns = turboquant::constants::b4_d128::kSigns;
             hostCentroids = turboquant::constants::b4_d128::kCentroids;
             hostThresholds = turboquant::constants::b4_d128::kThresholds;
             nCentroids = 16;
             nThresholds = 15;
+        }
+        else  // b == 12
+        {
+            // bits=12: reuse the b8 signs table (random ±1 mask is bit-depth independent);
+            // dedicated 4096-centroid codebook from b12_d128.
+            hostSigns = turboquant::constants::b8_d128::kSigns;
+            hostCentroids = turboquant::constants::b12_d128::kCentroids;
+            hostThresholds = turboquant::constants::b12_d128::kThresholds;
+            nCentroids = 4096;
+            nThresholds = 4095;
         }
         if (cudaMalloc(&signs, kDHead) != cudaSuccess)
             return false;

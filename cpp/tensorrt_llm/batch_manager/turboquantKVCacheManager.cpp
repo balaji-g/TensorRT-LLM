@@ -61,8 +61,8 @@ TurboquantKVCacheManager::TurboquantKVCacheManager(SizeType32 turboquantBits,
         std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse)
     , mTurboquantBits(turboquantBits)
 {
-    TLLM_CHECK_WITH_INFO(turboquantBits == 4 || turboquantBits == 8,
-        "TurboquantKVCacheManager: turboquantBits must be 4 or 8, got %d", turboquantBits);
+    TLLM_CHECK_WITH_INFO(turboquantBits == 4 || turboquantBits == 8 || turboquantBits == 12,
+        "TurboquantKVCacheManager: turboquantBits must be 4, 8, or 12, got %d", turboquantBits);
     TLLM_LOG_INFO("TurboquantKVCacheManager constructed (bits=%d). Pool sizing override active in allocatePools.",
         mTurboquantBits);
 }

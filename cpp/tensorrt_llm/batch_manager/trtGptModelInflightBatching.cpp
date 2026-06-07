@@ -638,7 +638,7 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     {
         char const* tqShrink = std::getenv("TQ_SHRINK_POOL");
         int tqBits = (tqShrink != nullptr) ? std::atoi(tqShrink) : 0;
-        if (tqBits == 4 || tqBits == 8)
+        if (tqBits == 4 || tqBits == 8 || tqBits == 12)
         {
             TLLM_LOG_INFO("[M12.4 B.3b] TQ_SHRINK_POOL=%d active -- pool will be allocated at packed+norms size",
                 tqBits);
