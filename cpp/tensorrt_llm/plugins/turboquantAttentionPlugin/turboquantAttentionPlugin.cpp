@@ -846,8 +846,41 @@ int TurboquantAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
         int const nQHeadsL = this->mNumHeads;
         (void)nQHeadsL;
         int const dHeadL = this->mHeadSize;
-        int const slotInnerBytes
-            = nKvHeadsL * kTokensPerBlockB22 * dHeadL * static_cast<int>(sizeof(std::uint16_t));
+        // The persistent KV pool's actual per-(block, layer, kv) slot stride
+        // depends on whether TurboquantKVCacheManager shrunk the pool
+        // (TQ_SHRINK_POOL env, mirrored from trtGptModelInflightBatching).
+        // - Manager NOT shrunk: pool slot = nKvHeads * tokensPerBlock * dHead
+        //   * sizeof(fp16) = 65536 (Llama-3-8B). Plugin uses fp16 stride.
+        // - Manager shrunk: pool slot = ceil((packed + norms) / dtype_bytes)
+        //   * dtype_bytes. Plugin must match or addresses drift across blocks
+        //   and eventually crash (task #86). The fp16-shape stride is what
+        //   the plugin USED to assume always; the shrunk pool needs the
+        //   smaller stride here so K3/K6 land at the right pool slots.
+        static int const sShrinkBits = []() {
+            char const* v = std::getenv("TQ_SHRINK_POOL");
+            return v != nullptr ? std::atoi(v) : 0;
+        }();
+        int slotInnerBytes;
+        if (sShrinkBits == mTurboquantBits)
+        {
+            // Match manager's allocation formula exactly (turboquantKVCacheManager.cpp:113-125).
+            int const rawElements = nKvHeadsL * dHeadL * kTokensPerBlockB22;
+            int const packedBytes = (rawElements * mTurboquantBits + 7) / 8;
+            int const normsBytes
+                = kTokensPerBlockB22 * nKvHeadsL * static_cast<int>(sizeof(float));
+            int const totalBytes = packedBytes + normsBytes;
+            int const dtypeBytes = static_cast<int>(sizeof(std::uint16_t));  // fp16 pool
+            int const newBlockSize = (totalBytes + dtypeBytes - 1) / dtypeBytes;
+            slotInnerBytes = newBlockSize * dtypeBytes;
+        }
+        else
+        {
+            // Legacy / TQ_SHRINK_POOL unset: pool is full fp16-shaped, use the
+            // unshrunk stride. K3 writes still pack at the front of each slot
+            // but waste the back ~half (bits=8) / ~67% (bits=4) of each slot.
+            slotInnerBytes
+                = nKvHeadsL * kTokensPerBlockB22 * dHeadL * static_cast<int>(sizeof(std::uint16_t));
+        }
 
         auto const& boDesc = inputDesc[hBOIdx];
         int const batchSize = boDesc.dims.d[0];
